@@ -1,0 +1,9 @@
+*.json
+*.jsonl
+*.db
+*.parquet
+*.csv
+*.log
+traj_data
+skills
+*/__pycache__
