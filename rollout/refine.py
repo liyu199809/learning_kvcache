@@ -4,12 +4,15 @@ Iterative refinement pipeline for Self-OPD data collection.
 Per (scenario, task_idx):
 
   1. Fresh AWMEnv session, reset(scenario, task_idx). This is the student's
-     env; DB state is mutated by the student's tool calls and is NOT reset
-     between rounds.
+     env. The env is RESET at the start of every round, so each round begins
+     from a pristine DB state — a round that corrupts the DB cannot poison
+     later rounds.
 
   2. For k = 1..K:
-       a. Student (Qwen3.5-4B) continues the conversation, calls tools on
-          the student env, produces `traj_k`. Each round the LLM has up
+       a. If k > 1, the student env is reset first (fresh DB; conversation
+          history — including teacher advice — carries over). Student
+          (Qwen3.5-4B) continues the conversation, calls tools on the
+          student env, produces `traj_k`. Each round the LLM has up
           to `student_max_iterations` LLM turns to converge.
        b. `verify` is invoked (code mode) — it's read-only so calling it
           multiple times is safe.
@@ -19,7 +22,9 @@ Per (scenario, task_idx):
           `# Advice: <one-liner>`. The teacher runs against its OWN
           separate AWMEnv session that has been synchronised to the
           student's current DB state by REPLAYING the student's successful
-          tool_calls so far. Teacher can call_tool up to 3 times to probe.
+          tool_calls from the CURRENT round (earlier rounds' mutations were
+          discarded by the per-round reset). Teacher can call_tool up to 3
+          times to probe.
           Only the `# Advice:` line is extracted; the teacher's private
           conversation is discarded.
        f. The advice is appended to the student conversation as a single
@@ -62,6 +67,7 @@ from rollout.common import (
 )
 from rollout.prompt import (
     STUDENT_NATIVE_SYSTEM_PROMPT,
+    STUDENT_NATIVE_FINAL_SYSTEM_PROMPT,
     TEACHER_ADVICE_SYSTEM_PROMPT,
     TEACHER_FINALIZE_SYSTEM_PROMPT,
     build_teacher_advice_input,
@@ -81,7 +87,8 @@ ADVICE_LINE_RE = re.compile(
 # Student half-turn: continue an existing `messages` list on an existing env.
 # Returns (updated_messages, per-turn trace list, final_answer_str,
 #          made_tool_call, executed_tool_calls, error_or_None).
-# The env may have been mutated by earlier tool calls; we do NOT reset.
+# The env may have been mutated by earlier tool calls in THIS round; we do
+# NOT reset here — resetting between rounds is the caller's job.
 # ---------------------------------------------------------------------------
 async def _student_step(env, llm: RetryLLM, messages: list[dict],
                          tools_schema: list[dict],
@@ -97,10 +104,16 @@ async def _student_step(env, llm: RetryLLM, messages: list[dict],
 
     for step in range(1, max_iterations + 1):
         step_used = step
+        is_last = step == max_iterations
+        tool_choice = "none" if is_last else "auto"
+        system_override = STUDENT_NATIVE_FINAL_SYSTEM_PROMPT if is_last else None
+        tools_schema = tools_schema if not is_last else None  # forbid tools on last turn
         try:
             turn = await llm_turn_native(llm, messages, tools=tools_schema,
                                          temperature=temperature,
-                                         max_tokens=max_tokens)
+                                         max_tokens=max_tokens,
+                                         tool_choice=tool_choice,
+                                         system_override=system_override)
         except Exception as e:
             error = f"student LLM error at step {step}: {e!r}"[:500]
             break
@@ -155,7 +168,7 @@ async def _student_step(env, llm: RetryLLM, messages: list[dict],
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc_id,
-                "content": f"{tool_response}",
+                "content": f"{tool_response}\n\nYou have {max_iterations-step-1} remaining opportunities for parallel tool calls. Once the count hits 0, you must respond to the user directly whether the task is completed or not.",
             })
 
     return {
@@ -394,7 +407,6 @@ class RefineJob:
         success = False
         success_at_round: int | None = None
         error: str | None = None
-        executed_tool_calls_cumulative: list[dict] = []
 
         try:
             await env.connect()
@@ -415,6 +427,13 @@ class RefineJob:
             ]
 
             for k in range(1, self.max_rounds + 1):
+                if k > 1:
+                    # Fresh DB state every round: mutations made by earlier
+                    # rounds are discarded so a corrupted state cannot cascade
+                    # into every later round. The conversation (incl. teacher
+                    # advice) carries over; only the env state is rebuilt.
+                    rr = await env.reset(scenario=self.scenario,
+                                         task_idx=self.task_idx)
                 turn_start_idx = len(student_messages)
                 step_result = await asyncio.wait_for(
                     _student_step(
@@ -429,7 +448,6 @@ class RefineJob:
                 student_messages = step_result["messages"]
                 turn_end_idx = len(student_messages)
                 new_executed = step_result["executed_tool_calls"]
-                executed_tool_calls_cumulative.extend(new_executed)
 
                 verify = await _verify_only(env, step_result["final_answer"])
 
@@ -460,8 +478,9 @@ class RefineJob:
                     break
 
                 # Ask the teacher for one line of advice. Uses a SEPARATE env
-                # session that we replay the student's executed tool calls
-                # onto so its DB state matches the student's current state.
+                # session that we replay THIS ROUND's executed tool calls
+                # onto so its DB state matches the student's current state
+                # (earlier rounds' mutations were discarded by the reset).
                 verify_error = None
                 vr = verify.get("verify_result") or {}
                 if isinstance(vr, dict):
@@ -474,7 +493,7 @@ class RefineJob:
                     task_idx=self.task_idx,
                     task=task_description,
                     student_messages=student_messages,
-                    past_tool_calls=executed_tool_calls_cumulative,
+                    past_tool_calls=new_executed,
                     verify_reward_type=verify["reward_type"],
                     verify_error=verify_error,
                     teacher_llm=self.teacher_llm,
@@ -500,7 +519,7 @@ class RefineJob:
 
                 student_messages.append({
                     "role": "user",
-                    "content": f"[Expert advice]\n# Advice: {teacher['advice']}",
+                    "content": f"[Expert advice]\n# Advice: {teacher['advice']}\n\nNotice: Your first tried failed and the environment has been reset to its initial state. please try again.",
                 })
 
         except asyncio.TimeoutError:

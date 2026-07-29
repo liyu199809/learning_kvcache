@@ -635,6 +635,18 @@ def _reasoning_from_content(content: str) -> str:
     return ""
 
 
+def _apply_system_override(wire: list[dict], system_text: str) -> list[dict]:
+    """Return a copy of `wire` whose leading system message content is replaced
+    with `system_text`. If the first message isn't a system message, one is
+    prepended. Does not mutate the input (shallow-copies the affected dict)."""
+    out = list(wire)
+    if out and out[0].get("role") == "system":
+        out[0] = {**out[0], "content": system_text}
+    else:
+        out.insert(0, {"role": "system", "content": system_text})
+    return out
+
+
 def _prepare_native_messages(messages: list[dict]) -> list[dict]:
     """Build the wire payload sent to the model from our stored `messages`.
 
@@ -670,7 +682,8 @@ def _prepare_native_messages(messages: list[dict]) -> list[dict]:
 async def llm_turn_native(llm: "RetryLLM", messages: list[dict], *,
                         temperature: float,
                         max_tokens: int,
-                        tools: list[dict] = None,tool_choice: str = "auto") -> LLMTurnNative:
+                        tools: list[dict] = None,tool_choice: str = "auto",
+                        system_override: str | None = None) -> LLMTurnNative:
     """Native-function-calling counterpart of `llm_turn`. Calls the LLM with a
     `tools` schema, appends a proper native assistant message (content +
     `tool_calls` with ids, plus a persisted `reasoning` field) to `messages`,
@@ -686,8 +699,17 @@ async def llm_turn_native(llm: "RetryLLM", messages: list[dict], *,
         `_prepare_native_messages`. This keeps continuity without letting every
         past reasoning block bloat the context.
       * Robust to the parser being off too: if no reasoning field is present,
-        an inline `<think>` block in `content` is split out instead."""
+        an inline `<think>` block in `content` is split out instead.
+
+    `system_override`: when set, the leading system message is replaced with
+    this text FOR THIS REQUEST ONLY (wire payload). The stored `messages` are
+    left untouched, so the persisted trajectory keeps the original system
+    prompt. Used to swap in a "final turn: answer directly, no tool calls"
+    prompt so the model doesn't emit literal `<tool_call>` markup as text when
+    `tool_choice="none"` disables native tool parsing."""
     wire_messages = _prepare_native_messages(messages)
+    if system_override is not None:
+        wire_messages = _apply_system_override(wire_messages, system_override)
     msg = await llm.chat_message(wire_messages, temperature=temperature,
                                  max_tokens=max_tokens,
                                  tools=tools, tool_choice=tool_choice)

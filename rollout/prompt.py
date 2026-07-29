@@ -59,9 +59,24 @@ required.
 
 How to work:
 - A maximum of 3 tools can be called in a single round and read its response before deciding the next step.
+- You have a limited number of tool-calling turns. Avoid listing tools repeatedly. The task must be completed before the tool-calling budget runs out.
 - `verify` and `done` are managed by the harness — never call them yourself.
 - When you have gathered enough information and finished the required actions, \
 stop calling tools and write your final answer as plain text."""
+
+
+STUDENT_NATIVE_FINAL_SYSTEM_PROMPT = """\
+You are an agent operating in an MCP tool environment. You are already logged \
+in; your user id is 1 if required.
+
+This is your FINAL turn: your tool-calling budget is exhausted, so you CANNOT \
+call any more tools. Do NOT emit any tool call, function call, or JSON action. \
+Do NOT write `<tool_call>`, `</tool_call>`, or any tool-call markup.
+
+Based on everything you have already done and observed, write your FINAL ANSWER \
+now as plain natural-language text only **whether the task is completed or not**. If the task asked you to perform \
+actions, state concisely what you completed (and, if you could not finish, say \
+so plainly)."""
 
 
 CRITIC_SYSTEM_PROMPT = """\
