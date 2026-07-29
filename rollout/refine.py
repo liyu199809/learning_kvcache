@@ -379,8 +379,9 @@ class RefineJob:
     scenario: str
     task_idx: int
     student_llm: RetryLLM
-    teacher_llm: RetryLLM
+    teacher_llm: RetryLLM | None
     awm_base_url: str
+    only_infer: bool = True
     max_rounds: int = 3
     student_max_iterations: int = 10
     teacher_max_iterations: int = 4
@@ -475,6 +476,12 @@ class RefineJob:
                     success_at_round = k
                     break
                 if k == self.max_rounds:
+                    break
+
+                # Inference-only mode: skip the advice module entirely. The
+                # student attempts each task once (+ verify) with no teacher
+                # feedback carried into a next round.
+                if self.only_infer:
                     break
 
                 # Ask the teacher for one line of advice. Uses a SEPARATE env
@@ -573,6 +580,11 @@ async def main():
     parser.add_argument("--end-scenario-idx", type=int, default=None)
 
     # rollout / refinement hyperparams
+    parser.add_argument("--only-infer", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Inference-only: run the student once per task and "
+                             "skip the teacher advice module. Pass --no-only-infer "
+                             "to enable the full refine (teacher-advice) loop.")
     parser.add_argument("--max-rounds", type=int, default=3,
                         help="Max number of student→verify→teacher_advice iterations.")
     parser.add_argument("--student-max-iterations", type=int, default=4,
@@ -622,24 +634,31 @@ async def main():
                         help="Optional cap on total (scenario,task) pairs.")
     args = parser.parse_args()
 
-    if not args.teacher_api_key:
-        raise SystemExit("teacher API key not set: export ARK_API_KEY or pass --teacher-api-key.")
-
     student_llm = RetryLLM(
         base_url=args.student_base_url,
         api_key=args.student_api_key,
         model=args.student_model,
         timeout=args.llm_timeout,
     )
-    teacher_llm = RetryLLM(
-        base_url=args.teacher_base_url,
-        api_key=args.teacher_api_key,
-        model=args.teacher_model,
-        timeout=args.llm_timeout,
-        limiter=RateLimiter(rpm=args.teacher_rpm, tpm=args.teacher_tpm),
-    )
-    print(f"[refine] student={args.student_model} teacher={args.teacher_model}")
-    print(f"[refine] teacher rate limit: {args.teacher_rpm} RPM, {args.teacher_tpm} TPM")
+    # The teacher is only needed for the full refine (advice) loop. In
+    # inference-only mode we never build it, so no teacher API key is required.
+    teacher_llm: RetryLLM | None = None
+    if args.only_infer:
+        print(f"[refine] student={args.student_model} teacher=<none> "
+              f"(only_infer=True: advice module disabled)")
+    else:
+        if not args.teacher_api_key:
+            raise SystemExit("teacher API key not set: export ARK_API_KEY or "
+                             "pass --teacher-api-key (required when --no-only-infer).")
+        teacher_llm = RetryLLM(
+            base_url=args.teacher_base_url,
+            api_key=args.teacher_api_key,
+            model=args.teacher_model,
+            timeout=args.llm_timeout,
+            limiter=RateLimiter(rpm=args.teacher_rpm, tpm=args.teacher_tpm),
+        )
+        print(f"[refine] student={args.student_model} teacher={args.teacher_model}")
+        print(f"[refine] teacher rate limit: {args.teacher_rpm} RPM, {args.teacher_tpm} TPM")
 
     all_scenarios = await _list_all_scenarios(args.awm_base_url)
     print(f"Total scenarios on server: {len(all_scenarios)}")
@@ -664,6 +683,7 @@ async def main():
             student_llm=student_llm,
             teacher_llm=teacher_llm,
             awm_base_url=args.awm_base_url,
+            only_infer=args.only_infer,
             max_rounds=args.max_rounds,
             student_max_iterations=args.student_max_iterations,
             teacher_max_iterations=args.teacher_max_iterations,
