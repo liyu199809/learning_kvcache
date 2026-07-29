@@ -57,12 +57,27 @@ class AWMScheduler(OpenEnvScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._envs: Dict[str, Any] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Env lifecycle
     # ------------------------------------------------------------------
+    async def _locked_step(self, uuid: str, wrapper, action) -> Any:
+        """Run wrapper.step(action) in a worker thread, serialized per wrapper.
+
+        Holds the wrapper's per-uuid lock across the whole to_thread call so at
+        most one step is in flight on that wrapper's shared WebSocket at a time.
+        """
+        lock = self._locks.get(uuid)
+        if lock is None:
+            # Defensive: no lock registered (e.g. env created out-of-band).
+            lock = self._locks[uuid] = asyncio.Lock()
+        async with lock:
+            return await asyncio.to_thread(wrapper.step, action)
+
     async def _close_env(self, uuid: str) -> None:
         wrapper = self._envs.pop(uuid, None)
+        self._locks.pop(uuid, None)
         if wrapper is not None:
             try:
                 await asyncio.to_thread(wrapper.close)
@@ -95,6 +110,7 @@ class AWMScheduler(OpenEnvScheduler):
             })
             await asyncio.to_thread(wrapper.reset)
             self._envs[req.uuid] = wrapper
+            self._locks[req.uuid] = asyncio.Lock()
 
         await asyncio.gather(*[_init(r) for r in requests])
 
@@ -110,17 +126,12 @@ class AWMScheduler(OpenEnvScheduler):
         # No tool calls => model produced a final answer; episode ends.
         if not tool_calls:
             final_answer = (msg.content or '').strip()
-            reward = await self._verify(wrapper, final_answer)
+            reward = await self._verify(uuid, wrapper, final_answer)
             await self._close_env(uuid)
             return {'done': True,
                     'rollout_infos': {'total_reward': reward,
                                       'final_answer': final_answer}}
 
-        # Execute up to 3 tool calls in parallel; collect tool messages.
-        # wrapper.step is synchronous (blocking WebSocket I/O on the wrapper's
-        # background loop), so route each call through asyncio.to_thread to
-        # keep swift's event loop free. The action is a raw dict - the server
-        # deserializes it via its "type" discriminator (call_tool -> CallToolAction).
         tool_calls = tool_calls[:3]
 
         async def _exec(tc):
@@ -134,7 +145,7 @@ class AWMScheduler(OpenEnvScheduler):
                     args = {}
             tcid = tc.get('id') if isinstance(tc, dict) else getattr(tc, 'id', '')
             action = {'tool_name': name, 'arguments': args}
-            obs, _r, _d, _m = await asyncio.to_thread(wrapper.step, CallToolAction(**action))
+            obs, _r, _d, _m = await self._locked_step(uuid, wrapper, CallToolAction(**action))
             context = self._tool_text(obs) + f"\n\nYou have {self.max_turns-current_turn-1} remaining opportunities for parallel tool calls. Once the count hits 0, you must respond to the user directly whether the task is completed or not."
             return {'role': 'tool', 'tool_call_id': tcid,
                     'name': name, 'content': context}
@@ -151,7 +162,7 @@ class AWMScheduler(OpenEnvScheduler):
         # doesn't leak.
         if self.max_turns and current_turn >= self.max_turns:
             final_answer = (msg.content or '').strip()
-            reward = await self._verify(wrapper, final_answer)
+            reward = await self._verify(uuid, wrapper, final_answer)
             await self._close_env(uuid)
             return {'done': True,
                     'rollout_infos': {'total_reward': reward,
@@ -191,14 +202,14 @@ class AWMScheduler(OpenEnvScheduler):
             return f"Error: {obs['error']}"
         return json.dumps(obs, ensure_ascii=False)
 
-    async def _verify(self, wrapper, final_answer: str) -> float:
+    async def _verify(self, uuid: str, wrapper, final_answer: str) -> float:
         action = {
             'type': 'call_tool',
             'tool_name': 'verify',
             'arguments': {'verifier_mode': 'code', 'final_answer': final_answer},
         }
         try:
-            obs, _r, _d, _m = await asyncio.to_thread(wrapper.step, action)
+            obs, _r, _d, _m = await self._locked_step(uuid, wrapper, action)
             return 1.0 if (obs or {}).get('reward_type') == 'complete' else 0.0
         except Exception:
             return 0.0
