@@ -12,7 +12,10 @@ from typing import List, Optional
 from .llm_client import AsyncLLM
 from .types import Action, BasicInfo, Observation, StepRecord
 from .native import native_turn
-from .tool_schemas import DB_TOOLS, DB_NATIVE_SYSTEM_PROMPT
+from .tool_schemas import (
+    DB_TOOLS, DB_NATIVE_SYSTEM_PROMPT,
+    OS_TOOLS, OS_NATIVE_SYSTEM_PROMPT,
+)
 
 
 class NativeReActAgent:
@@ -43,6 +46,15 @@ class NativeReActAgent:
     def reset(self, info: BasicInfo) -> None:
         self.task_instruction = info.instruction
         self.prompt_type = info.prompt_type or self.prompt_type
+        # 每个 benchmark 通过 meta_data 注入 native 配置；缺省回退 DB。
+        meta = info.meta_data or {}
+        self.tools = meta.get("native_tools") or self.tools or DB_TOOLS
+        self.system_prompt = (
+            meta.get("native_system_prompt") or self.system_prompt or DB_NATIVE_SYSTEM_PROMPT
+        )
+        # 结算动作名（DB=submit, OS=finish）与提前结算守卫命令（None 表示不加守卫）。
+        self.finish_action = str(meta.get("finish_action", "submit")).lower()
+        self.guardrail_command = meta.get("guardrail_command", "SHOW TABLES;")
         self.messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": info.instruction},
@@ -79,8 +91,8 @@ class NativeReActAgent:
             self.messages.append({
                 "role": "user",
                 "content": (
-                    "This is the LAST round. You MUST call the submit tool now to "
-                    "commit your final answer. Do not call execute again."
+                    f"This is the LAST round. You MUST call the {self.finish_action} "
+                    f"tool now to conclude the task. Do not call execute again."
                 ),
             })
 
@@ -114,7 +126,8 @@ class NativeReActAgent:
                              history: List[StepRecord]) -> Action:
         if not tool_calls:
             self._pending_tool_call_id = None
-            return {"action": "submit", "params": {}, "_parse_error": "no_tool_call"}
+            return {"action": getattr(self, "finish_action", "submit"), "params": {},
+                    "_parse_error": "no_tool_call"}
         tc = tool_calls[0]
         self._pending_tool_call_id = tc.get("id") or None
         fn = tc.get("function", {}) or {}
@@ -127,16 +140,20 @@ class NativeReActAgent:
         if not isinstance(args, dict):
             args = {}
 
-        if name == "submit":
-            has_execute = any(
-                isinstance(r.action, dict)
-                and str(r.action.get("action", "")).lower().strip() == "execute"
-                for r in history
-            )
-            if not has_execute:
-                return {"action": "execute", "params": {"command": "SHOW TABLES;"},
-                        "_parse_error": "guardrail_prevent_early_submit"}
-            return {"action": "submit", "params": {k: v for k, v in args.items()}}
+        finish_action = getattr(self, "finish_action", "submit")
+        guardrail_cmd = getattr(self, "guardrail_command", "SHOW TABLES;")
+        if name in (finish_action, "submit", "finish"):
+            # 提前结算守卫：尚未 execute 过就结算，且配置了守卫命令时，改为安全探查。
+            if guardrail_cmd:
+                has_execute = any(
+                    isinstance(r.action, dict)
+                    and str(r.action.get("action", "")).lower().strip() == "execute"
+                    for r in history
+                )
+                if not has_execute:
+                    return {"action": "execute", "params": {"command": guardrail_cmd},
+                            "_parse_error": "guardrail_prevent_early_submit"}
+            return {"action": finish_action, "params": {k: v for k, v in args.items()}}
         if name == "execute":
             command = str(args.get("command", "")).strip()
             return {"action": "execute", "params": {"command": command}}

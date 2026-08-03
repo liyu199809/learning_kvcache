@@ -90,3 +90,66 @@ Example 2 (commit the final answer for a SELECT task): call the `submit` tool wi
 
 The task will finish once you call `submit` or the number of rounds reaches the limit, and the system will judge whether you pass the task or not.
 On the LAST round you MUST call `submit` to commit your answer, otherwise the task will be judged as FAIL."""
+
+
+# ---------------------------------------------------------------------------
+# OS (os_interaction) 工具与系统提示
+# ---------------------------------------------------------------------------
+OS_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "execute",
+            "description": (
+                "Execute a Bash command (or a small script) on the Ubuntu system "
+                "and return its stdout/stderr. Avoid interactive commands (e.g. read)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Bash command(s) to run."}
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": (
+                "Call this when the task is complete and no further command is needed. "
+                "The system will then run a hidden evaluation to judge success."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
+
+
+# 绝大部分沿用官方 TASK_REQUIREMENT_DICT[OS_INTERACTION]，仅把动作格式改为工具调用，
+# 附示例并强调最后一轮必须 finish。
+OS_NATIVE_SYSTEM_PROMPT = """I will provide you with a task to perform on a Linux (Ubuntu) system. Your objective is to complete the task by executing the appropriate Bash commands.
+
+### Interaction Rules:
+1. Thorough Analysis and Reasoning:
+    - Before performing any action, carefully analyze the task and explain your thought process.
+    - Include a detailed explanation of the logic behind your choice of commands and approach.
+
+2. Action Choices (every round call exactly ONE tool):
+    - `execute`: run Bash command(s). Put the command in the `command` argument.
+    - `finish`: call it when the task is complete and no further action is required.
+
+3. Other Guidelines:
+    - Ensure all Bash commands are compatible with Linux (Ubuntu) systems.
+    - Avoid interactive operations (e.g., read, readline) in your Bash commands.
+
+Here are two examples of how to call the tools:
+Example 1 (run a command): call the `execute` tool with
+  {"command": "grep -r 'ERROR' /var/log/app/error_*.log > /var/log/app/errors_summary.log"}
+Example 2 (conclude the task): call the `finish` tool with {}
+
+### Task Completion:
+    - The task will conclude when you call `finish` or the number of rounds reaches the limit.
+    - The system will then evaluate whether the task was successfully completed.
+    - On the LAST round you MUST call `finish`, otherwise the task will be judged as FAIL."""

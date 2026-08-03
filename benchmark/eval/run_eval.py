@@ -57,6 +57,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--output-dir", default=None)
     # lifelong_db 专用：MySQL 镜像（9.x 缺 MD5/SHA1 内置函数，须用 8.0）
     ap.add_argument("--mysql-image", default="mysql:8.0")
+    # lifelong_os 专用：单条 bash 命令超时（秒）
+    ap.add_argument("--os-timeout", type=int, default=20)
     # judge 家族预留（本期未使用）
     ap.add_argument("--judge-model", default=None)
     ap.add_argument("--judge-base-url", default=None)
