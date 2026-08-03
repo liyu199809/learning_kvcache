@@ -103,6 +103,42 @@ class AsyncLLM:
                 self.call_count += 1
         return _assistant_message_text(response.choices[0].message)
 
+    async def chat_message(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: Optional[list[dict]] = None,
+        tool_choice: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ):
+        """返回完整 assistant message（可读 .content / .tool_calls / .reasoning_content）。
+
+        tools 提供时透传给端点以启用 native function-calling。失败返回 None。
+        """
+        tokens_to_use = max_tokens if max_tokens is not None else self.max_completion_tokens
+        sampling = {"temperature": self.temperature, "top_p": self.top_p}
+        try:
+            create_kwargs: dict[str, Any] = dict(model=self.model, messages=messages, **sampling)
+            if tokens_to_use is not None:
+                create_kwargs["max_tokens"] = tokens_to_use
+            if tools is not None:
+                create_kwargs["tools"] = tools
+                if tool_choice is not None:
+                    create_kwargs["tool_choice"] = tool_choice
+            response = await self.aclient.chat.completions.create(**create_kwargs)
+        except Exception as e:
+            print(f"[AsyncLLM] chat_message failed: {type(e).__name__}: {e}")
+            return None
+        if response is None or not getattr(response, "choices", None):
+            return None
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            with self._lock:
+                self.total_input_tokens += getattr(usage, "prompt_tokens", 0) or 0
+                self.total_output_tokens += getattr(usage, "completion_tokens", 0) or 0
+                self.call_count += 1
+        return response.choices[0].message
+
     def usage_summary(self) -> dict[str, Any]:
         with self._lock:
             return {

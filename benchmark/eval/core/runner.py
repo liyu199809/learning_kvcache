@@ -1,6 +1,6 @@
 """通用评测 runner：单 episode 环路 + 并发调度 + 结果落盘 + pass@1 汇总。
 
-与具体 benchmark 无关，只依赖 Task / TaskSuite / Scorer / ReActAgent 抽象。
+与具体 benchmark 无关，只依赖 Task / TaskSuite / Scorer / NativeReActAgent 抽象。
 环路逻辑移植并瘦身自 opd_evolver/runners/task_runner.py::SimpleTaskRunner.run。
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from .agent import ReActAgent
+from .agent import NativeReActAgent
 from .llm_client import AsyncLLM
 from .scorer import Scorer
 from .types import EpisodeResult, StepRecord
@@ -31,6 +31,7 @@ class EvalRunner:
         prompt_type: str,
         output_dir: Path,
         concurrency: int = 4,
+        llm_max_tokens=None,
     ):
         self.llm = llm
         self.suite = suite
@@ -39,6 +40,7 @@ class EvalRunner:
         self.prompt_type = prompt_type
         self.output_dir = Path(output_dir)
         self.concurrency = concurrency
+        self.llm_max_tokens = llm_max_tokens
         self.scorer: Scorer = suite.scorer()
         self.trajectory_dir = self.output_dir / "trajectories"
         self.csv_path = self.output_dir / "summary.csv"
@@ -47,7 +49,8 @@ class EvalRunner:
     async def _run_episode(self, index: int) -> EpisodeResult:
         task: Task = self.suite.make_task(index)
         info = task.get_basic_info()
-        agent = ReActAgent(self.llm, prompt_type=info.prompt_type or self.prompt_type)
+        agent = NativeReActAgent(self.llm, prompt_type=info.prompt_type or self.prompt_type,
+                                 max_tokens=self.llm_max_tokens)
         agent.reset(info)
 
         trace: List[StepRecord] = []
@@ -75,29 +78,19 @@ class EvalRunner:
                 action, raw_response, raw_input = step_result
                 obs_before = obs
                 obs_next, reward, step_done, step_info = await task.step(action)
-                trace.append(
-                    StepRecord(obs_before, action, reward, raw_response, step_done, step_info,
-                               raw_input=raw_input, observation_after=obs_next)
-                )
+                rec = StepRecord(obs_before, action, reward, raw_response, step_done, step_info,
+                                 raw_input=raw_input, observation_after=obs_next)
+                rec.debug = getattr(agent, "last_debug", None)
+                trace.append(rec)
                 total_reward += reward
                 obs = obs_next
                 if step_done:
                     done = True
                     break
             if not done:
-                # max_steps 到达，强制 submit 结算。
-                try:
-                    obs_before = obs
-                    obs, reward, _, step_info = await task.step({"action": "submit", "params": {}})
-                    total_reward = float(reward)
-                    trace.append(
-                        StepRecord(obs_before, {"action": "submit", "params": {}}, reward,
-                                   "forced_submit", True, step_info, observation_after=obs)
-                    )
-                    done = True
-                except Exception as e:  # noqa
-                    error = f"forced_submit_failed: {e}"
-                    done = True
+                # 严格对齐官方 LifelongAgentBench：到达轮数上限却未主动 submit，
+                # 视为 TASK_LIMIT_REACHED，直接判 fail（不再 forced-submit 兜底）。
+                done = True
         except Exception as e:  # noqa
             error = f"{type(e).__name__}: {e}"
         finally:
@@ -145,7 +138,7 @@ class EvalRunner:
             self.trajectory_dir.mkdir(parents=True, exist_ok=True)
             steps = []
             for i, r in enumerate(result.trace):
-                steps.append({
+                step_obj = {
                     "step": i + 1,
                     "action": r.action,
                     "observation": r.observation,
@@ -153,8 +146,12 @@ class EvalRunner:
                     "reward": r.reward,
                     "done": r.done,
                     "info": r.info,
+                    "raw_input": r.raw_input,
                     "raw_response": r.raw_response,
-                })
+                }
+                if getattr(r, "debug", None) is not None:
+                    step_obj["debug"] = r.debug
+                steps.append(step_obj)
             payload = {
                 "task_id": info.env_id,
                 "benchmark": result.benchmark,

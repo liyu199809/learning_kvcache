@@ -97,6 +97,7 @@ async def main() -> int:
         prompt_type="db",
         output_dir=output_dir,
         concurrency=args.concurrency,
+        llm_max_tokens=args.llm_max_completion_tokens,
     )
 
     results = await runner.run(indices)

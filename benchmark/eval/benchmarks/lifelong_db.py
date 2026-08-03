@@ -249,14 +249,14 @@ class LifelongDBTask(Task):
             if not command:
                 return {"error": "No command provided"}, 0.0, False, {"error": "no_command"}
             output = await asyncio.to_thread(self.runtime.execute, command)
-            done = self.steps >= self.max_steps
-            self.done = done
+            # execute 本身从不结束 episode：到达 max_steps 由 runner 的循环边界收束。
+            # 严格对齐官方：末轮仍在 execute 而未 submit，episode 结束即判 fail。
             return (
                 {"command": command, "output": output, "current_step": self.steps,
                  "max_steps": self.max_steps},
                 0.0,
-                done,
-                {"max_steps_reached": done} if done else {},
+                False,
+                {},
             )
 
         if action_type == "submit":

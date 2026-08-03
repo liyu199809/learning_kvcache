@@ -33,6 +33,7 @@ class StepRecord:
     info: Dict[str, Any]
     raw_input: Optional[str] = None
     observation_after: Optional[Observation] = None
+    debug: Optional[Dict[str, Any]] = None
 
 
 @dataclass
