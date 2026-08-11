@@ -1,0 +1,2 @@
+- name: awm_agent
+  _target_: rollout.verl_awm_agent_loop.AWMAgentLoop
