@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 class AWMAgentLoop(ToolAgentLoop):
     """ToolAgentLoop backed by one persistent AWM OpenEnv session."""
 
+    _TOOL_BUDGET_REMINDER = (
+        "You have {remaining} remaining opportunities for parallel tool calls. "
+        "Once the count hits 0, you must respond to the user directly whether the task is completed or not."
+    )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._env_client = None
@@ -224,6 +229,30 @@ class AWMAgentLoop(ToolAgentLoop):
         self._last_assistant_text = self._clean_assistant_text(content or "")
         return state
 
+    def _remaining_parallel_tool_opportunities(self, agent_data: AgentData) -> int | None:
+        """Return tool batches remaining after the batch currently being processed.
+
+        ``max_user_turns`` limits observation/tool-result turns.  The assistant
+        limit needs one additional turn reserved for the required direct final
+        answer, so both limits produce the same 4..0 countdown for the phase-2
+        configuration (5 user turns, 6 assistant turns).
+        """
+        limits = []
+        if self.max_user_turns is not None:
+            limits.append(self.max_user_turns - agent_data.user_turns - 1)
+        if self.max_assistant_turns is not None:
+            limits.append(self.max_assistant_turns - agent_data.assistant_turns - 1)
+        return max(0, min(limits)) if limits else None
+
+    async def _call_tool(self, tool_call, tools_kwargs: dict[str, Any], agent_data: AgentData):
+        """Append the AWM tool budget after verl has truncated the observation."""
+        response, reward, extra = await super()._call_tool(tool_call, tools_kwargs, agent_data)
+        remaining = self._remaining_parallel_tool_opportunities(agent_data)
+        if remaining is not None:
+            reminder = self._TOOL_BUDGET_REMINDER.format(remaining=remaining)
+            response = response.model_copy(update={"text": f"{response.text or ''}\n\n{reminder}"})
+        return response, reward, extra
+
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         state = await super()._handle_processing_tools_state(agent_data)
         # The current batch of tool messages is retained for debugging, but no
@@ -234,7 +263,6 @@ class AWMAgentLoop(ToolAgentLoop):
         """Run one model trajectory against one persistent OpenEnv session."""
         if "tools" not in kwargs:
             raise ValueError("AWMAgentLoop requires a per-sample 'tools' field")
-        breakpoint()
         self._install_sample_tools(kwargs["tools"])
         env_config = self._normalize_env_config(kwargs.get("env_config"))
 
