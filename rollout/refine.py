@@ -581,7 +581,7 @@ async def main():
 
     # rollout / refinement hyperparams
     parser.add_argument("--only-infer", action=argparse.BooleanOptionalAction,
-                        default=True,
+                        default=False,
                         help="Inference-only: run the student once per task and "
                              "skip the teacher advice module. Pass --no-only-infer "
                              "to enable the full refine (teacher-advice) loop.")

@@ -143,6 +143,18 @@ def run_tau2(args) -> int:
     env = dict(os.environ)
     env.setdefault("OPENAI_API_KEY", args.api_key or "EMPTY")
     env["OPENAI_API_BASE"] = base_url
+    # Retail includes natural-language assertions.  Upstream defaults their
+    # judge to GPT-4.1, which is unavailable when the whole benchmark is run
+    # against a local OpenAI-compatible endpoint.  Route this judge through the
+    # same model and keep thinking disabled so every tau2 LLM role follows the
+    # requested protocol.
+    nl_judge_args = {
+        **common_llm_args,
+        "max_tokens": max_completion_tokens,
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    }
+    env["TAU2_LLM_NL_ASSERTIONS"] = llm_model
+    env["TAU2_LLM_NL_ASSERTIONS_ARGS"] = json.dumps(nl_judge_args)
     # tau2 runs one synchronous LiteLLM call per simulation worker.  Size the
     # shared HTTPX pool above the worker count so --concurrency is not silently
     # capped by the upstream default of ten connections.

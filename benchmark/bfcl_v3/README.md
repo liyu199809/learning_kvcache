@@ -71,9 +71,10 @@ python -m benchmark.eval.run_eval --benchmark bfcl_v3 \
 ```
 
 `--model` is the vLLM `--served-model-name` (also the API model id).
-`--bfcl-model-path` is the local weights dir; the runner symlinks it under
-`benchmark/bfcl_v3/<model>` so the official OSS handler can load the tokenizer
-and address the API with the same name. `--bfcl-model-key` selects the official
+`--bfcl-model-path` is the local weights dir; it is only used as the official
+OSS handler's tokenizer/config source. The API model id is passed separately
+via `BFCL_API_MODEL_ID` (local patch `api_model_id.patch`, applied by
+`setup.sh`), so no symlink is created. `--bfcl-model-key` selects the official
 handler (`Qwen/Qwen3-4B-FC` by default) and stays fixed across checkpoints
 (Base / Simulator / EnvScaler / AWM); only `--bfcl-model-path` and the vLLM
 service change per experiment.

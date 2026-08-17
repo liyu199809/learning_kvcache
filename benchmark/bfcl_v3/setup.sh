@@ -8,7 +8,6 @@ OFFICIAL_ROOT="${BFCL_OFFICIAL_ROOT:-$SCRIPT_DIR/official}"
 PROJECT_PYTHON="${PROJECT_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
 BFCL_COMMIT="cd9429ccf3d4d04156affe883c495b3b047e6b64"
 MARKER="$OFFICIAL_ROOT/.bfcl_commit"
-MODEL_ALIAS="${BFCL_MODEL_API_NAME:-qwen3.5-4b}"
 
 if [[ ! -d "$GORILLA_REPO/.git" ]]; then
     echo "Missing Gorilla checkout: $GORILLA_REPO" >&2
@@ -34,6 +33,14 @@ if [[ "$installed_commit" != "$BFCL_COMMIT" ]]; then
         berkeley-function-call-leaderboard \
         | tar -x -C "$OFFICIAL_ROOT" --strip-components=1
     printf '%s\n' "$BFCL_COMMIT" >"$MARKER"
+fi
+
+# Local patch: let the OSS handler send BFCL_API_MODEL_ID as the API model id
+# instead of --local-model-path (which stays the local tokenizer source).
+# Idempotent: skipped when the tree already carries the marker env var.
+OSS_HANDLER="bfcl_eval/model_handler/local_inference/base_oss_handler.py"
+if ! grep -q "BFCL_API_MODEL_ID" "$OFFICIAL_ROOT/$OSS_HANDLER"; then
+    (cd "$OFFICIAL_ROOT" && git apply "$SCRIPT_DIR/api_model_id.patch")
 fi
 
 if [[ ! -x "$PROJECT_PYTHON" ]]; then
@@ -94,10 +101,6 @@ PY
 BFCL_PROJECT_ROOT="$SCRIPT_DIR/artifacts" \
 PYTHONPATH="$OFFICIAL_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
 "$PROJECT_PYTHON" -m bfcl_eval test-categories >/dev/null
-
-touch "$SCRIPT_DIR/.gitignore"
-grep -Fxq "$MODEL_ALIAS" "$SCRIPT_DIR/.gitignore" \
-    || printf '%s\n' "$MODEL_ALIAS" >>"$SCRIPT_DIR/.gitignore"
 
 echo "Official commit: $BFCL_COMMIT"
 echo "Environment:     $PROJECT_ROOT/.venv"

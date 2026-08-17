@@ -146,7 +146,7 @@ class AWMScheduler(OpenEnvScheduler):
             tcid = tc.get('id') if isinstance(tc, dict) else getattr(tc, 'id', '')
             action = {'tool_name': name, 'arguments': args}
             obs, _r, _d, _m = await self._locked_step(uuid, wrapper, CallToolAction(**action))
-            context = self._tool_text(obs) + f"\n\nYou have {self.max_turns-current_turn-1} remaining opportunities for parallel tool calls. Once the count hits 0, you must respond to the user directly whether the task is completed or not."
+            context = self._tool_text(obs)[:800] + f"\n\nYou have {self.max_turns-current_turn-1} remaining opportunities for parallel tool calls. Once the count hits 0, you must respond to the user directly whether the task is completed or not."
             return {'role': 'tool', 'tool_call_id': tcid,
                     'name': name, 'content': context}
 

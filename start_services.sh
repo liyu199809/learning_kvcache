@@ -4,12 +4,16 @@
 #   2) AWM environment server (FastAPI + MCP) on :$AWM_PORT
 #
 # Usage:
-#   ./start_services.sh start        # start both (or only what's missing)
-#   ./start_services.sh stop         # stop both
-#   ./start_services.sh restart      # stop then start
-#   ./start_services.sh status       # report PIDs + health
-#   ./start_services.sh logs vllm    # tail -f vllm log
-#   ./start_services.sh logs awm     # tail -f awm log
+#   ./start_services.sh start               # start both (or only what's missing)
+#   ./start_services.sh start vllm          # start only vLLM
+#   ./start_services.sh start tool          # start only the AWM tool/env server
+#   ./start_services.sh stop                # stop both
+#   ./start_services.sh stop vllm           # stop only vLLM
+#   ./start_services.sh stop tool           # stop only the AWM tool/env server
+#   ./start_services.sh restart [vllm|tool] # stop then start (optionally one)
+#   ./start_services.sh status              # report PIDs + health
+#   ./start_services.sh logs vllm           # tail -f vllm log
+#   ./start_services.sh logs tool           # tail -f awm log
 
 set -euo pipefail
 
@@ -20,17 +24,18 @@ PROJECT_ROOT="${PROJECT_ROOT:-/mnt/storage/disk3/self_evolver}"
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
 OPENENV_ROOT="${OPENENV_ROOT:-$PROJECT_ROOT/OpenEnv}"
 
-MODEL_PATH="${MODEL_PATH:-/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B}"
+MODEL_PATH="${MODEL_PATH:-checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_fix_context/global_step_200/actor/huggingface_merged}" # /mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B
 MODEL_NAME="${MODEL_NAME:-qwen3.5-4b}"
 
 VLLM_PORT="${VLLM_PORT:-8000}"
-VLLM_GPU="${VLLM_GPU:-0}"
+VLLM_GPU="${VLLM_GPU:-0,1,2,3,4,5,6,7}"
 VLLM_MAX_LEN="${VLLM_MAX_LEN:-262144}"
 VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.85}"
 VLLM_DTYPE="${VLLM_DTYPE:-bfloat16}"
-VLLM_DP="${VLLM_DP:-1}"                        # data-parallel replicas
+VLLM_DP="${VLLM_DP:-8}"                        # data-parallel replicas
 VLLM_TP="${VLLM_TP:-1}"                        # tensor-parallel size
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-256}"  # per-replica batch concurrency
+VLLM_API_SERVER_COUNT="${VLLM_API_SERVER_COUNT:-1}"  # one frontend balances all DP replicas
 
 AWM_PORT="${AWM_PORT:-8899}"
 AWM_DATA_DIR="${AWM_DATA_DIR:-$PROJECT_ROOT/awm_data}"
@@ -82,6 +87,25 @@ wait_http() {
     done
 }
 
+# Resolve CLI service selector(s) (vllm|tool) into the internal service ids
+# used by this script (vllm|awm). No selector => all services.
+# Fills the global array SERVICES.
+SERVICES=()
+parse_services() {
+    SERVICES=()
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            vllm) SERVICES+=("vllm") ;;
+            tool) SERVICES+=("awm") ;;
+            *) err "unknown service '$arg' (expected: vllm|tool)"; exit 2 ;;
+        esac
+    done
+    if [[ ${#SERVICES[@]} -eq 0 ]]; then
+        SERVICES=("vllm" "awm")
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # vLLM
 # ---------------------------------------------------------------------------
@@ -105,6 +129,7 @@ start_vllm() {
             --gpu-memory-utilization $VLLM_GPU_UTIL \
             --dtype $VLLM_DTYPE \
             --data-parallel-size $VLLM_DP \
+            --api-server-count $VLLM_API_SERVER_COUNT \
             --tensor-parallel-size $VLLM_TP \
             --max-num-seqs $VLLM_MAX_NUM_SEQS \
             --enable-auto-tool-choice \
@@ -161,7 +186,8 @@ start_awm() {
         cd '$OPENENV_ROOT' && \
         AWM_DATA_DIR='$AWM_DATA_DIR' PYTHONPATH=src:envs \
             '$VENV_PATH/bin/uvicorn' envs.agent_world_model_env.server.app:app \
-                --host 0.0.0.0 --port $AWM_PORT
+                --host 0.0.0.0 --port $AWM_PORT \
+                --ws-ping-interval 20 --ws-ping-timeout 300
     " >"$AWM_LOG" 2>&1 </dev/null &
     local pid=$!
     disown "$pid" 2>/dev/null || true
@@ -233,8 +259,10 @@ cmd="${1:-start}"
 case "$cmd" in
     start)
         mkdir -p "$LOG_DIR"
-        start_vllm
-        start_awm
+        parse_services "${@:2}"
+        for svc in "${SERVICES[@]}"; do
+            if [[ "$svc" == "vllm" ]]; then start_vllm; else start_awm; fi
+        done
         echo
         status
         echo
@@ -248,13 +276,20 @@ case "$cmd" in
         echo "        $0 restart"
         ;;
     stop)
-        stop_vllm
-        stop_awm
+        parse_services "${@:2}"
+        for svc in "${SERVICES[@]}"; do
+            if [[ "$svc" == "vllm" ]]; then stop_vllm; else stop_awm; fi
+        done
         ;;
     restart)
-        stop_vllm; stop_awm
+        parse_services "${@:2}"
+        for svc in "${SERVICES[@]}"; do
+            if [[ "$svc" == "vllm" ]]; then stop_vllm; else stop_awm; fi
+        done
         sleep 2
-        start_vllm; start_awm
+        for svc in "${SERVICES[@]}"; do
+            if [[ "$svc" == "vllm" ]]; then start_vllm; else start_awm; fi
+        done
         status
         ;;
     status)
@@ -262,14 +297,19 @@ case "$cmd" in
         ;;
     logs)
         case "${2:-}" in
-            vllm) exec tail -n 200 -f "$VLLM_LOG" ;;
-            awm)  exec tail -n 200 -f "$AWM_LOG" ;;
-            *)    err "usage: $0 logs {vllm|awm}"; exit 2 ;;
+            vllm)     exec tail -n 200 -f "$VLLM_LOG" ;;
+            tool|awm) exec tail -n 200 -f "$AWM_LOG" ;;
+            *)        err "usage: $0 logs {vllm|tool}"; exit 2 ;;
         esac
         ;;
     *)
         cat <<EOF >&2
-Usage: $0 {start|stop|restart|status|logs vllm|logs awm}
+Usage: $0 {start|stop|restart} [vllm|tool]
+       $0 status
+       $0 logs {vllm|tool}
+
+  start/stop/restart with no service selector act on BOTH services.
+  vllm = vLLM OpenAI server;  tool = AWM tool/env server.
 
 Environment overrides:
   MODEL_PATH, MODEL_NAME, VLLM_PORT, VLLM_GPU, VLLM_MAX_LEN,

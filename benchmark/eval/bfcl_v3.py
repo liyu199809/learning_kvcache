@@ -10,7 +10,9 @@ commit 的官方 ``bfcl_eval``，只做「入口 + 配置 + 产物目录」的�
   - 官方源码通过 PYTHONPATH 挂载（不注册发行版元数据，避免 NumPy 1.x 等回退）；
   - 官方 result/score 落到统一的 output-dir，与其它 benchmark 同一棵产物树；
   - 官方 OSS handler 把 --local-model-path 同时当作本地 tokenizer 路径与 vLLM 的
-    API model id，故以 model 名建软链指向权重目录，并在该目录下运行；
+    API model id，两者经 api_model_id.patch 解耦：--local-model-path 传权重绝对
+    路径（仅作 tokenizer/config 来源），BFCL_API_MODEL_ID 指定发送给服务的
+    model id（须与 vLLM --served-model-name 一致）；
   - 绕开官方 ``bfcl scores`` 的 'Non-Live Exec Acc' 列崩溃（v3 已删 exec 类别，
     但 scores 子命令仍硬编码该列），改为直接读 data_overall.csv 打印安全列，
     不修改官方源码。
@@ -52,21 +54,15 @@ def _split_endpoint(base_url: str) -> tuple[str, str]:
     return host, port
 
 
-def _prepare_model_alias(bfcl_root: Path, model_alias: str, model_path: str) -> None:
-    """建软链 <bfcl_root>/<model_alias> -> model_path。
-
-    官方 OSS handler 用 --local-model-path 同时作为本地 tokenizer 路径与 API
-    model id；软链名必须与 vLLM --served-model-name 一致，才能连上现有服务。
-    """
-    if "/" in model_alias or model_alias in (".", ".."):
-        raise SystemExit(f"--model 必须是纯模型名（用作 vLLM model id）: {model_alias}")
-    alias_path = bfcl_root / model_alias
-    target = Path(model_path).resolve()
-    if alias_path.exists() or alias_path.is_symlink():
-        if alias_path.resolve() != target:
-            raise SystemExit(f"模型软链已被占用: {alias_path} -> {alias_path.resolve()}")
-        return
-    alias_path.symlink_to(target)
+def _check_model_path(model_path: Path) -> None:
+    """权重目录必须是官方 handler 认可的本地模型目录。"""
+    if not model_path.is_dir():
+        raise SystemExit(f"--bfcl-model-path 不是目录: {model_path}")
+    for file_name in ("config.json", "tokenizer_config.json"):
+        if not (model_path / file_name).exists():
+            raise SystemExit(
+                f"--bfcl-model-path 缺少 {file_name}: {model_path}"
+            )
 
 
 def _check_server(base_url: str, model_alias: str) -> None:
@@ -102,6 +98,7 @@ def _run_bfcl(
     host: str,
     port: str,
     args: List[str],
+    api_model_id: str,
 ) -> None:
     env = dict(os.environ)
     env["PYTHONPATH"] = (
@@ -112,6 +109,8 @@ def _run_bfcl(
     env["BFCL_PROJECT_ROOT"] = str(project_root_env)
     env["VLLM_ENDPOINT"] = host
     env["VLLM_PORT"] = port
+    # 经 api_model_id.patch 解耦：API model id 独立于 --local-model-path。
+    env["BFCL_API_MODEL_ID"] = api_model_id
     subprocess.run(
         _bfcl_cmd(official_root, project_python, args),
         cwd=str(bfcl_root),
@@ -163,9 +162,9 @@ def run_bfcl(args) -> int:
 
     host, port = _split_endpoint(args.openai_base_url)
     model_alias = args.model
-    model_path = args.bfcl_model_path
+    model_path = Path(args.bfcl_model_path).resolve()
 
-    _prepare_model_alias(bfcl_root, model_alias, model_path)
+    _check_model_path(model_path)
     _check_server(args.openai_base_url, model_alias)
 
     # 官方 result/score 落到统一 output-dir（作为 BFCL_PROJECT_ROOT）。
@@ -182,6 +181,7 @@ def run_bfcl(args) -> int:
     print("=" * 72)
     print(f"Model key:    {model_key}")
     print(f"vLLM model:   {model_alias} @ {args.openai_base_url}")
+    print(f"Weights:      {model_path}")
     print(f"Categories:   {categories}")
     print(f"Output:       {project_root_env}")
     print("=" * 72)
@@ -194,7 +194,7 @@ def run_bfcl(args) -> int:
         "--temperature", str(args.temperature),
         "--num-threads", str(args.concurrency),
         "--skip-server-setup",
-        "--local-model-path", model_alias,
+        "--local-model-path", str(model_path),
         "--result-dir", result_dir,
     ]
     if getattr(args, "bfcl_include_input_log", True):
@@ -212,6 +212,7 @@ def run_bfcl(args) -> int:
     _run_bfcl(
         official_root=official_root, bfcl_root=bfcl_root, project_python=project_python,
         project_root_env=project_root_env, host=host, port=port, args=gen_args,
+        api_model_id=model_alias,
     )
 
     # 2) evaluate
@@ -225,6 +226,7 @@ def run_bfcl(args) -> int:
     _run_bfcl(
         official_root=official_root, bfcl_root=bfcl_root, project_python=project_python,
         project_root_env=project_root_env, host=host, port=port, args=eval_args,
+        api_model_id=model_alias,
     )
 
     # 3) scores（绕开官方 scores 子命令的列崩溃）

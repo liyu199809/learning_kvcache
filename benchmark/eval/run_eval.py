@@ -81,7 +81,8 @@ def parse_args() -> argparse.Namespace:
     # bfcl_v3 专用（走官方批处理管线）：
     ap.add_argument("--bfcl-model-path",
                     default="/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B",
-                    help="本地权重目录；软链为 --model 名供官方 handler 作 tokenizer 路径。")
+                    help="本地权重目录；仅作官方 handler 的 tokenizer/config 来源，"
+                         "API model id 由 --model（BFCL_API_MODEL_ID）独立指定。")
     ap.add_argument("--bfcl-model-key", default="Qwen/Qwen3-4B-FC",
                     help="BFCL 官方 model handler 注册名（决定 prompt 模板与解析）。")
     ap.add_argument("--bfcl-categories", default="all",

@@ -57,6 +57,7 @@ import asyncio
 import copy
 import json
 import re
+from tqdm import tqdm
 from typing import Any, Dict, List, Optional
 
 ADVICE_MARKER = "[Expert advice]"
@@ -315,29 +316,44 @@ async def _fetch_tools_by_scenario(scenarios: List[str],
     """Fetch each scenario's tool schemas once and return a mapping
     scenario -> tools JSON *string* (swift's `tools` field format). The schema
     is produced by the same `tools_to_openai_schema` used at rollout time so
-    the training-time tool list matches what the student actually saw."""
+    the training-time tool list matches what the student actually saw.
+
+    Scenarios are fetched CONCURRENTLY via ``as_completed`` (rather than
+    ``gather``) so a single slow / timing-out scenario does not block the
+    rest; each one is merged into the result as soon as it finishes.
+    Imports are done once in the outer scope so concurrent workers do not
+    race on the import lock."""
     from agent_world_model_env import AWMEnv
     from openenv.core.env_server.mcp_types import ListToolsAction
     from rollout.common import tools_to_openai_schema
 
-    out: Dict[str, str] = {}
-    for scenario in scenarios:
-        env = AWMEnv(base_url=awm_base_url,
-                     message_timeout_s=60.0, connect_timeout_s=30.0)
-        try:
-            await env.connect()
-            await env.reset(scenario=scenario, task_idx=0)
-            list_res = await env.step(ListToolsAction())
-            schemas = tools_to_openai_schema(list_res.observation.tools)
-            out[scenario] = json.dumps(schemas, ensure_ascii=False)
-        except Exception as e:  # noqa: BLE001 — best-effort; skip tools on failure
-            print(f"[warn] failed to fetch tools for {scenario}: {e!r}")
-            out[scenario] = ""
-        finally:
+    sem = asyncio.Semaphore(500)
+
+    async def _fetch_one(scenario: str) -> tuple[str, str]:
+        async with sem:
+            env = AWMEnv(base_url=awm_base_url,
+                         message_timeout_s=60.0, connect_timeout_s=30.0)
             try:
-                await env.close()
-            except Exception:
-                pass
+                await env.connect()
+                await env.reset(scenario=scenario, task_idx=0)
+                list_res = await env.step(ListToolsAction())
+                schemas = tools_to_openai_schema(list_res.observation.tools)
+                return scenario, json.dumps(schemas, ensure_ascii=False)
+            except Exception as e:  # noqa: BLE001 - best-effort; skip tools on failure
+                print(f"[warn] failed to fetch tools for {scenario}: {e!r}")
+                return scenario, ""
+            finally:
+                try:
+                    await env.close()
+                except Exception:
+                    pass
+
+    tasks = [asyncio.create_task(_fetch_one(s)) for s in scenarios]
+    out: Dict[str, str] = {}
+    for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks),
+                    desc="Fetching tool schemas"):
+        scenario, tools = await fut
+        out[scenario] = tools
     return out
 
 

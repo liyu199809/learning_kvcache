@@ -6,4 +6,12 @@
 *.log
 traj_data
 skills
-*/__pycache__
+__pycache__/
+output
+wandb
+benchmark/eval/core/__pycache__
+benchmark/eval/benchmarks/__pycache__
+benchmark/bfcl_v3/official/
+benchmark/bfcl_v3/artifacts/
+outputs
+checkpoints
