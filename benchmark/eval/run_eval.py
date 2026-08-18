@@ -25,6 +25,12 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 
+# 统一加载仓库根目录的 .env（API keys 等）。不覆盖 shell 里已有的变量，
+# 因此临时 export 依然优先生效。文件已 gitignore，不装载入仓库。
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+
 # 允许以脚本或模块方式运行。
 if __package__ in (None, ""):
     import sys
@@ -106,6 +112,19 @@ def parse_args() -> argparse.Namespace:
                     help="启用 tau2 agent 的 Qwen thinking（默认关闭以提速）。")
     ap.add_argument("--tau2-user-thinking", action="store_true",
                     help="启用 tau2 user simulator 的 Qwen thinking（默认关闭）。")
+    # tau2 Retail NL 断言 judge（外部 OpenAI 兼容服务，默认火山方舟）：
+    ap.add_argument("--tau2-judge-model", default=None,
+                    help="judge 的 litellm 模型名（默认 openai/deepseek-v4-pro-ga-260813）。")
+    ap.add_argument("--tau2-judge-base-url", default=None,
+                    help="judge 的 OpenAI 兼容 base URL（默认方舟 "
+                         "https://ark.cn-beijing.volces.com/api/v3）。")
+    ap.add_argument("--tau2-judge-api-key-env", default="ARK_API_KEY",
+                    help="存放 judge API key 的环境变量名（默认 ARK_API_KEY；"
+                         "key 只从环境读取，不落明文）。未设置该环境变量时 "
+                         "judge 回退本地 vLLM 模型。")
+    ap.add_argument("--tau2-judge-thinking", action="store_true",
+                    help="启用 judge 思考（默认关闭；Ark 的 budget_tokens "
+                         "不生效，disabled 为最低档）。")
     return ap.parse_args()
 
 

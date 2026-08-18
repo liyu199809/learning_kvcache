@@ -26,6 +26,12 @@ DEFAULT_TAU2_MAX_COMPLETION_TOKENS = 4096
 DEFAULT_TAU2_USER_MAX_COMPLETION_TOKENS = 4096
 DEFAULT_TAU2_MAX_STEPS = 50
 
+# Retail 自然语言断言 judge 默认走火山方舟（OpenAI 兼容）。API key 只从环境变量
+# 读取，绝不写入代码/命令行/产物。
+DEFAULT_TAU2_JUDGE_MODEL = "openai/deepseek-v4-pro-ga-260813"
+DEFAULT_TAU2_JUDGE_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+DEFAULT_TAU2_JUDGE_API_KEY_ENV = "ARK_API_KEY"
+
 
 def _tau2_root() -> Path:
     """benchmark/tau2 目录（官方源码、专用 venv、setup.sh 所在处）。"""
@@ -144,16 +150,40 @@ def run_tau2(args) -> int:
     env.setdefault("OPENAI_API_KEY", args.api_key or "EMPTY")
     env["OPENAI_API_BASE"] = base_url
     # Retail includes natural-language assertions.  Upstream defaults their
-    # judge to GPT-4.1, which is unavailable when the whole benchmark is run
-    # against a local OpenAI-compatible endpoint.  Route this judge through the
-    # same model and keep thinking disabled so every tau2 LLM role follows the
-    # requested protocol.
-    nl_judge_args = {
-        **common_llm_args,
-        "max_tokens": max_completion_tokens,
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
-    }
-    env["TAU2_LLM_NL_ASSERTIONS"] = llm_model
+    # judge to GPT-4.1; route this judge to an external OpenAI-compatible
+    # model (Volcano Ark deepseek by default) whenever its API key is present
+    # in the environment, falling back to the local vLLM model otherwise.
+    # The key is only read from the environment so it never appears in the
+    # repo, process args, or artifacts.
+    judge_api_key_env = getattr(args, "tau2_judge_api_key_env", None) or DEFAULT_TAU2_JUDGE_API_KEY_ENV
+    judge_api_key = os.getenv(judge_api_key_env)
+    judge_thinking = getattr(args, "tau2_judge_thinking", False)
+    if judge_api_key:
+        judge_llm_model = getattr(args, "tau2_judge_model", None) or DEFAULT_TAU2_JUDGE_MODEL
+        judge_base_url = getattr(args, "tau2_judge_base_url", None) or DEFAULT_TAU2_JUDGE_BASE_URL
+        nl_judge_args = {
+            "api_base": judge_base_url,
+            "api_key": judge_api_key,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_tokens": max_completion_tokens,
+        }
+        # 思考长度默认压到最低：Ark 的 budget_tokens 不生效（实测 budget=1 反而
+        # 多于默认），disabled 是唯一可靠的最低档（0 思考 token）。
+        if not judge_thinking:
+            nl_judge_args["extra_body"] = {"thinking": {"type": "disabled"}}
+    else:
+        print(
+            f"[tau2] 未设置 {judge_api_key_env}，NL 断言 judge 回退本地 vLLM 模型 "
+            f"({llm_model})。"
+        )
+        judge_llm_model = llm_model
+        nl_judge_args = {
+            **common_llm_args,
+            "max_tokens": max_completion_tokens,
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        }
+    env["TAU2_LLM_NL_ASSERTIONS"] = judge_llm_model
     env["TAU2_LLM_NL_ASSERTIONS_ARGS"] = json.dumps(nl_judge_args)
     # tau2 runs one synchronous LiteLLM call per simulation worker.  Size the
     # shared HTTPX pool above the worker count so --concurrency is not silently
@@ -185,6 +215,11 @@ def run_tau2(args) -> int:
         "HTTP pool:    "
         f"connections={http_max_connections} "
         f"keepalive={http_max_keepalive_connections}"
+    )
+    print(
+        f"NL judge:     {judge_llm_model}"
+        + (f" @ {nl_judge_args['api_base']}" if judge_api_key else " (fallback)")
+        + f" thinking={'on' if judge_thinking else 'off'}"
     )
     print(f"Output:       {save_to}")
     print("=" * 72)
