@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-browsergym_env"
+version = "0.1.0"
+description = "BrowserGym Environment for OpenEnv - Web automation using Playwright"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv>=0.2.3",
+    "browsergym-core==0.14.3",
+    "browsergym-miniwob==0.14.3",
+    "gymnasium>=0.29.0",
+    "playwright==1.44.0",
+    "greenlet==3.0.3",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-cov>=4.0.0",
+    "ipykernel>=6.29.5",
+]
+
+[project.scripts]
+server = "browsergym_env.server.app:main"
+
+[tool.setuptools]
+packages = ["browsergym_env", "browsergym_env.server"]
+package-dir = { "browsergym_env" = ".", "browsergym_env.server" = "server" }
+
+[tool.setuptools.package-data]
+browsergym_env = ["**/*.yaml", "**/*.yml", "**/*.md"]

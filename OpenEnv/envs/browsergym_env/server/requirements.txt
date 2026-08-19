@@ -1,0 +1,7 @@
+browsergym-core==0.14.3
+browsergym-miniwob==0.14.3
+gymnasium>=0.29.0
+playwright==1.44.0
+greenlet==3.0.3
+Pillow>=10.0.0
+beautifulsoup4>=4.12.0

@@ -16,3 +16,9 @@ benchmark/bfcl_v3/artifacts/
 outputs
 checkpoints
 .env
+
+# 合并进来的子仓库：解除上方全局忽略（*.json 等），由各子目录自己的 .gitignore 负责过滤
+!ms-swift/**
+!verl/**
+!OpenEnv/**
+!benchmark/opd-evolver/**
