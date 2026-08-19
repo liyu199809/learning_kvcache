@@ -31,6 +31,37 @@ class Qwen3_5DeltaVirtualPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
             torch.zeros(self.num_virtual_tokens, self.hidden_size)
         )
         set_weight_attrs(self.prefix_tokens, {"weight_loader": default_weight_loader})
+        self.register_buffer("_cached_prefix_conv_state", None, persistent=False)
+        self.register_buffer("_cached_prefix_recurrent_state", None, persistent=False)
+        self._cached_prefix_key = None
+        self._prefix_cache_misses = 0
+
+    def invalidate_virtual_prefix_cache(self) -> None:
+        self._cached_prefix_key = None
+        self._cached_prefix_conv_state = None
+        self._cached_prefix_recurrent_state = None
+
+    def _get_virtual_prefix_states(
+        self,
+        conv_state_dtype: torch.dtype,
+        recurrent_state_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (
+            self.prefix_tokens._version,
+            self.prefix_tokens.device,
+            conv_state_dtype,
+            recurrent_state_dtype,
+        )
+        if key != self._cached_prefix_key:
+            conv_state, recurrent_state = self._compute_virtual_prefix_states(
+                conv_state_dtype,
+                recurrent_state_dtype,
+            )
+            self._cached_prefix_conv_state = conv_state.detach()
+            self._cached_prefix_recurrent_state = recurrent_state.detach()
+            self._cached_prefix_key = key
+            self._prefix_cache_misses += 1
+        return self._cached_prefix_conv_state, self._cached_prefix_recurrent_state
 
     def _compute_virtual_prefix_states(
         self,
@@ -113,7 +144,7 @@ class Qwen3_5DeltaVirtualPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
         self_kv_cache = self.kv_cache[context.virtual_engine]
         conv_state = self_kv_cache[0].transpose(-1, -2)
         recurrent_state = self_kv_cache[1]
-        prefix_conv, prefix_recurrent = self._compute_virtual_prefix_states(
+        prefix_conv, prefix_recurrent = self._get_virtual_prefix_states(
             conv_state.dtype,
             recurrent_state.dtype,
         )
@@ -146,6 +177,16 @@ class Qwen3_5DeltaVirtualPrefixForConditionalGeneration(
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         finally:
             qwen3_5.Qwen3_5GatedDeltaNet = original_cls
+
+    def invalidate_virtual_prefix_caches(self) -> None:
+        for module in self.modules():
+            if isinstance(module, Qwen3_5DeltaVirtualPrefixGatedDeltaNet):
+                module.invalidate_virtual_prefix_cache()
+
+    def load_weights(self, weights):
+        loaded = super().load_weights(weights)
+        self.invalidate_virtual_prefix_caches()
+        return loaded
 
 
 __all__ = ["Qwen3_5DeltaVirtualPrefixForConditionalGeneration"]

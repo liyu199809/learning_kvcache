@@ -31,7 +31,7 @@ def normalize_tool_calls(messages):
                     fn["arguments"] = {}   # 解析失败兜底，避免模板再炸
     return msgs
 
-data =  read_jsonl("traj_data/refine_debug.jsonl")
+data =  read_jsonl("traj_data/swift2_opsd.jsonl")
 
 print(data[0])
 

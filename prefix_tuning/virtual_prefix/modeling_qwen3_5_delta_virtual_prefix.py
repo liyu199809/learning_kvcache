@@ -154,6 +154,171 @@ class Qwen3_5DeltaVirtualPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
                 restored[batch_idx, positions] = output[batch_idx, start : start + num_valid]
         return restored
 
+    def _compute_packed_prefix_states(
+        self,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute differentiable convolution and recurrent states for one prefix.
+
+        The recurrent state can be broadcast to all packed sequences directly.
+        causal-conv1d does not allow ``seq_idx`` and ``initial_states`` at the
+        same time, so callers seed the packed convolution by prepending only
+        the final ``kernel_size - 1`` projected prefix values per segment.
+        """
+
+        prefix = self.prefix_tokens.to(dtype).unsqueeze(0)
+        mixed_qkv = self.in_proj_qkv(prefix).transpose(1, 2).contiguous()
+        history_length = self.conv_kernel_size - 1
+        conv_tail = torch.nn.functional.pad(
+            mixed_qkv,
+            (max(history_length - mixed_qkv.shape[-1], 0), 0),
+        )[:, :, -history_length:]
+
+        convolved = self.causal_conv1d_fn(
+            x=mixed_qkv,
+            weight=self.conv1d.weight.squeeze(1),
+            bias=self.conv1d.bias,
+            activation=self.activation,
+        ).transpose(1, 2)
+        query, key, value = torch.split(
+            convolved,
+            [self.key_dim, self.key_dim, self.value_dim],
+            dim=-1,
+        )
+        query = query.reshape(1, self.num_virtual_tokens, -1, self.head_k_dim)
+        key = key.reshape(1, self.num_virtual_tokens, -1, self.head_k_dim)
+        value = value.reshape(1, self.num_virtual_tokens, -1, self.head_v_dim)
+        beta = self.in_proj_b(prefix).sigmoid()
+        a = self.in_proj_a(prefix)
+        g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
+        if self.num_v_heads // self.num_k_heads > 1:
+            repeats = self.num_v_heads // self.num_k_heads
+            query = query.repeat_interleave(repeats, dim=2)
+            key = key.repeat_interleave(repeats, dim=2)
+
+        _, recurrent_state = self.chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        if recurrent_state is None:
+            raise RuntimeError("Delta virtual prefix kernel did not return its final recurrent state")
+        return conv_tail, recurrent_state
+
+    def _packed_causal_conv(
+        self,
+        mixed_qkv: torch.Tensor,
+        prefix_conv_tail: torch.Tensor,
+        cu_seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run causal convolution over packed segments with prefix context."""
+
+        lengths = (cu_seq_lens[1:] - cu_seq_lens[:-1]).to(dtype=torch.long)
+        history_length = prefix_conv_tail.shape[-1]
+        projected_segments = torch.split(mixed_qkv.squeeze(0), lengths.tolist(), dim=-1)
+        extended_segments = [
+            torch.cat((prefix_conv_tail.squeeze(0), segment), dim=-1)
+            for segment in projected_segments
+        ]
+        # causal-conv1d accepts [B, C, T], but its seq_idx kernel requires the
+        # underlying channel-last stride layout (stride(C) == 1).
+        extended = torch.cat(extended_segments, dim=-1).transpose(0, 1).contiguous()
+        extended = extended.unsqueeze(0).transpose(1, 2)
+        extended_lengths = lengths + history_length
+        seq_idx = torch.repeat_interleave(
+            torch.arange(lengths.numel(), device=mixed_qkv.device, dtype=torch.int32),
+            extended_lengths,
+        ).unsqueeze(0)
+        convolved_extended = self.causal_conv1d_fn(
+            x=extended,
+            weight=self.conv1d.weight.squeeze(1),
+            bias=self.conv1d.bias,
+            activation=self.activation,
+            seq_idx=seq_idx,
+        )
+        convolved_segments = torch.split(convolved_extended.squeeze(0), extended_lengths.tolist(), dim=-1)
+        return torch.cat(
+            [segment[:, history_length:] for segment in convolved_segments],
+            dim=-1,
+        ).unsqueeze(0)
+
+    def _forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seq_lens_q: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply one shared differentiable prefix state to every packed segment."""
+
+        if not qwen3_5.is_fast_path_available:
+            raise RuntimeError(
+                "Packed Delta virtual prefix requires flash-linear-attention and causal-conv1d fast kernels"
+            )
+        if hidden_states.shape[0] != 1:
+            raise ValueError(
+                "Packed Delta virtual prefix expects hidden_states batch dimension 1; "
+                f"got {tuple(hidden_states.shape)}"
+            )
+        if cu_seq_lens_q.ndim != 1 or cu_seq_lens_q.numel() < 2:
+            raise ValueError(
+                "Packed Delta virtual prefix expects one-dimensional cu_seq_lens_q with at least two entries"
+            )
+        cu_seq_lens_q = cu_seq_lens_q.to(device=hidden_states.device, dtype=torch.int32)
+        if int(cu_seq_lens_q[0]) != 0 or int(cu_seq_lens_q[-1]) != hidden_states.shape[1]:
+            raise ValueError(
+                "Packed Delta virtual prefix cu_seq_lens_q must span exactly all hidden states; "
+                f"got first={int(cu_seq_lens_q[0])}, last={int(cu_seq_lens_q[-1])}, "
+                f"tokens={hidden_states.shape[1]}"
+            )
+        if bool(((cu_seq_lens_q[1:] - cu_seq_lens_q[:-1]) <= 0).any()):
+            raise ValueError("Packed Delta virtual prefix does not support empty sequences")
+
+        prefix_conv_tail, prefix_recurrent_state = self._compute_packed_prefix_states(hidden_states.dtype)
+        num_sequences = cu_seq_lens_q.numel() - 1
+        initial_state = prefix_recurrent_state.expand(num_sequences, -1, -1, -1).contiguous()
+
+        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2).contiguous()
+        mixed_qkv = self._packed_causal_conv(mixed_qkv, prefix_conv_tail, cu_seq_lens_q)
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+        query, key, value = torch.split(
+            mixed_qkv,
+            [self.key_dim, self.key_dim, self.value_dim],
+            dim=-1,
+        )
+        total_tokens = hidden_states.shape[1]
+        query = query.reshape(1, total_tokens, -1, self.head_k_dim)
+        key = key.reshape(1, total_tokens, -1, self.head_k_dim)
+        value = value.reshape(1, total_tokens, -1, self.head_v_dim)
+        z = self.in_proj_z(hidden_states).reshape(1, total_tokens, -1, self.head_v_dim)
+        beta = self.in_proj_b(hidden_states).sigmoid()
+        a = self.in_proj_a(hidden_states)
+        g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
+        if self.num_v_heads // self.num_k_heads > 1:
+            repeats = self.num_v_heads // self.num_k_heads
+            query = query.repeat_interleave(repeats, dim=2)
+            key = key.repeat_interleave(repeats, dim=2)
+
+        core_attn_out, _ = self.chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seq_lens_q,
+        )
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+        z = z.reshape(-1, self.head_v_dim)
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(1, total_tokens, -1)
+        return self.out_proj(core_attn_out)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -172,11 +337,13 @@ class Qwen3_5DeltaVirtualPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
                 **kwargs,
             )
 
-        if kwargs.get("cu_seq_lens_q") is not None:
-            raise NotImplementedError(
-                "Packed/padding-free Transformers training needs rebuilt cu_seqlens "
-                "after inserting per-layer virtual tokens; use padded batches for now."
-            )
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+        if cu_seq_lens_q is not None:
+            if cache_params is not None:
+                raise ValueError("Packed Delta virtual prefix training does not support cache_params")
+            if attention_mask is not None:
+                raise ValueError("Packed Delta virtual prefix expects attention_mask=None")
+            return self._forward_packed(hidden_states, cu_seq_lens_q)
 
         token_mask = None
         if attention_mask is not None:
