@@ -1,211 +1,329 @@
-# Benchmark 实验报告（qwen3.5-4b 基线 + LoRA step 200）
+# Qwen3.5-4B Tool-Use Benchmark 实验记录
 
-- 日期：基线 2026-08-13；LoRA 追加评测 2026-08-17（Asia/Shanghai）
-- 基线模型服务：tau2/Lifelong 使用 `qwen3.5-4b`；BFCL 基线产物标签为 `Qwen3-4B (FC)`
-- LoRA 模型服务：`qwen3.5-4b-lora-r64-a128-step200`，OpenAI-compatible vLLM endpoint `http://127.0.0.1:8000/v1`
-- 评测范围：tau2-bench（Airline + Retail，关闭 thinking）、BFCL v3 all、LifelongDB test、LifelongOS test
-- tau2/Lifelong 采样：temperature=0，top_p=1，单次 trial（pass@1）；BFCL 使用其产物中的官方 score 汇总
+最后更新：2026-08-22（Asia/Shanghai；当日勘误见第 8 节）
 
-## 1. LoRA step 200 追加评测
+本文汇总 Qwen3.5-4B 原生模型、全参数微调（Full-FT）step 200、LoRA step 200、Independent Delta KV Prefix step 203（常规 LR 与 largelr 两个 run）以及 Hybrid Delta + Residual Attention Prefix（step 180/200/203）在 BFCL v3、tau2-bench 与 LifelongAgentBench 上的正式结果。主结果表参考论文表格形式组织：同一 benchmark 下按方法逐行对比，最佳值以 **粗体** 标出。
 
-### 1.1 Checkpoint 合并与服务
+> 口径提示：tau2/Lifelong 是单次 trial 的 Pass@1，BFCL 是单次生成的官方准确率；均非多次运行均值。**2026-08-21 勘误**：08-13 评测时 vLLM 端点实际加载的是 Full-FT step 200 的 merged 权重（该导出完成于 08-13 11:50，评测 12:01 启动），当时被误记为"Base"；`Base native (08-20)` 才是唯一一次真正的原生模型评测。因此 08-13 与 08-20 两行是**两个不同模型**，其差值是方法差异，不是复现波动。tau2 的 Retail judge 配置跨日期不同，因此 tau2 表按 judge 配置分组，粗体表示同组最佳。
 
-- 输入 checkpoint：`checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_lora_r64_a128/global_step_200/actor/`。
-- 该 checkpoint 是 FSDP2、world size 6 的 LoRA-only 分片；LoRA 配置为 rank 64、alpha 128，base model 为 `/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B`。
-- 先用 VERL merger 导出 PEFT adapter，再使用 PEFT `merge_and_unload(safe_merge=True)` 合入 base model。最终模型位于 `checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_lora_r64_a128/global_step_200/actor/huggingface_merged/`，约 8.5 GiB、4,539,265,536 parameters。
-- 已用抽样权重验证合并结果满足 `base + (alpha/r) × B@A`（仅有 bfloat16 舍入误差），并通过 Transformers 元数据加载。
-- 使用 `start_services.sh start vllm` 启动，served model name 为 `qwen3.5-4b-lora-r64-a128-step200`。评测结束后 vLLM 仍在运行，PID 1281906，port 8000，health=ok。
-- 服务 smoke test 已验证普通文本与 tool call 均可用，且 reasoning 字段为空；tau2 的 agent、user simulator 和 judge 均关闭 thinking。
+## 1. 实验对象
 
-### 1.2 与基线对比
+| Method | 权重/Checkpoint | 训练或合并形式 | 正式评测日期 |
+|---|---|---|---:|
+| Full-FT (step 200, 08-13) | `checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_fix_context/global_step_200/actor/huggingface_merged/` | FSDP2 world size 6 全参数微调（`run_qwen3_5_4b_awm_opsd_full.sh`），step 200 导出 merged HF 权重；08-13 评测时端点加载的是该权重，产物当时被误标为 "Base" | 2026-08-13 |
+| Base native (08-20) | `/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B` | 原生 dense 权重（2026-06-07 下载后未改动），唯一的原生基线评测 | 2026-08-20 |
+| LoRA r64/a128 (step 200) | `checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_lora_r64_a128/global_step_200/actor/` | FSDP2 world size 6；先导出 PEFT adapter，再 `merge_and_unload(safe_merge=True)` 合入 base model | 2026-08-17 |
+| Independent ΔKV Prefix m2048 (step 203) | `checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_independent_delta_kv_prefix_m2048/global_step_203/actor/` | FSDP2 world size 6；CPU 聚合为 96 个 BF16 prefix tensors，共 305,135,616 个 prefix 参数；prefix LR `5e-6` | 2026-08-20 |
+| Independent ΔKV Prefix m2048 largelr (step 203) | `checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_independent_delta_kv_prefix_largelr/global_step_203/actor/` | 同上，唯一差异是 prefix LR 提高到 `5e-5`（`run_qwen3_5_4b_awm_opsd_independent_delta_kv_prefix_m2048.sh` 默认 `ACTOR_LR=5e-5`，10× 于常规 run）；同为 96 个 BF16 prefix tensors、305,135,616 参数 | 2026-08-21 |
+| Independent ΔKV Prefix m2048 largelr (step 180) | `checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_independent_delta_kv_prefix_largelr/global_step_180/actor/` | 同一 largelr run 的 step 180 checkpoint，用于检查训练后期是否退化（与 step 203 同口径全量评测） | 2026-08-21 |
+| Hybrid Δ + Residual Attn Prefix G2048/A256 (step 180/200/203) | `checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_hybrid_delta_residual_attention_prefix_g2048_a256/global_step_{180,200,203}/actor/` | FSDP2 world size 6，prefix LR `5e-6`（`run_qwen3_5_4b_awm_opsd_hybrid_delta_residual_attention_prefix_g2048_a256.sh`）；在 Independent ΔKV Prefix（24 个线性层，G=2048）之上给 8 个 full-attention 层各加 key/value prefix（A=256）。CPU 聚合为 96 个 ΔKV tensors + 16 个 attention tensors，共 315,621,376 个 prefix 参数 | 2026-08-22 |
 
-| Benchmark | 子集 | 基线 | LoRA step 200 | 变化 |
+LoRA 合并模型位于 `checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_lora_r64_a128/global_step_200/actor/huggingface_merged/`。两个 Prefix 部署模型分别位于 `/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B-IndependentDeltaKVPrefix-step203/` 与 `/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B-IndependentDeltaKVPrefix-largelr-step203/`；Hybrid Prefix 的三个部署模型位于 `/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B-HybridDeltaResidualAttentionPrefix-G2048-A256-step{180,200,203}/`（prepared 模型 `Qwen3.5-4B-HybridDeltaResidualAttentionPrefix-G2048-A256` 复用 base 权重）。prefix 类方法的“合并”是聚合 FSDP prefix 分片并复用 base 权重，推理时由模型实现显式注入 prefix KV，不会把 prefix 数值折叠进 dense 权重。
+
+## 2. 实验设置
+
+### 2.1 推理服务
+
+| 项目 | 设置 |
+|---|---|
+| GPU | 8 × NVIDIA A800-SXM4-80GB（每卡 81920 MiB） |
+| vLLM | 0.18.0，OpenAI-compatible API |
+| 并行 | Data Parallel = 8，Tensor Parallel = 1，API server count = 1 |
+| 精度 | BF16 |
+| 上下文 | max model length = 262144 |
+| 显存利用率 | 0.85 |
+| Tool calling | `--enable-auto-tool-choice`，reasoning parser=`qwen3`，tool-call parser=`qwen3_coder` |
+| Thinking | tau2/Lifelong 显式关闭；服务 smoke test 的 reasoning 字段为空 |
+| 其他环境 | Python 3.11.15，PyTorch 2.10.0+cu128，CUDA runtime 12.8，Docker 29.1.3 |
+
+2026-08-20 原生评测、08-21 largelr 评测当天各 step 服务依次启停；08-22 Hybrid 三个 step 服务依次启停后，当前保留运行的是 Hybrid step 203 服务：
+
+- Endpoint：`http://127.0.0.1:8000/v1`
+- Served model：`qwen3.5-4b-hybrid-delta-residual-prefix-step203`
+- 加载权重：`/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B-HybridDeltaResidualAttentionPrefix-G2048-A256-step203`
+- 日志：`workspace/eval_logs/vllm_server/hybrid_prefix_g2048_a256_step203_vllm.log`
+- Smoke test：普通文本精确返回 `OK`；tool call 正确生成 `get_weather({"city":"北京"})`
+
+（历史：08-20 原生服务 `qwen3.5-4b`，日志 `vllm_server/qwen35_4b_native_rerun_20260820_vllm.log`；08-21 largelr step 203/180 服务日志 `vllm_server/prefix_largelr_step{203,180}_vllm.log`；08-22 Hybrid step 180/200 服务日志 `vllm_server/hybrid_prefix_g2048_a256_step{180,200}_vllm.log`。vllm 服务日志统一归档在 `workspace/eval_logs/vllm_server/`。）
+
+### 2.2 Benchmark 配置
+
+| Benchmark | 数据范围 | 推理限制 | 并发 | 判分方式 |
+|---|---|---|---:|---|
+| BFCL v3 | 官方 `all`，17 个类别，共 4441 条生成任务 | temperature=0；context=262144 | 64 | 官方 generate → evaluate → aggregate 管线；使用 `Qwen/Qwen3-4B-FC` handler |
+| tau2 Airline | official `base` split，50 tasks，1 trial | max steps=50；agent/user max tokens=4096；temperature=0；top_p=1；thinking off | 32 | 环境 DB、communicate checks 与 action checks |
+| tau2 Retail | official `base` split，114 tasks，1 trial | 同 Airline | 32 | 环境 DB + NL assertions；judge 配置见下文 |
+| LifelongDB | `test`，500 tasks | max steps=6；max completion tokens=2048；MySQL 8.0 | 16 | 数据库最终状态与提交结果精确判分 |
+| LifelongOS | `test`，500 tasks | max steps=8；max completion tokens=2048；shell timeout=20s；LLM step timeout=180s | 16 | Ubuntu 容器内隐藏检查脚本 |
+
+### 2.3 tau2 的 simulator 与 judge
+
+tau2 不是固定 prompt 的静态问答：user simulator 也由模型生成，因此这里始终让 user simulator 使用与被测 agent 相同的模型。Retail 的 NL-assertion judge 分为两组：
+
+| Judge 组 | 方法 | Retail NL judge |
+|---|---|---|
+| Historical local | Full-FT (08-13)、LoRA step 200 | 本地被测模型，thinking off |
+| Ark DeepSeek | Base native (08-20)、Prefix step 203（含 largelr）、Hybrid Prefix（08-22） | 方舟 `deepseek-v4-pro-ga-260813`，thinking off |
+
+运行入口会从仓库 `.env` 重新加载 `ARK_API_KEY`。2026-08-20 两次运行的配置输出均显示实际使用方舟 judge，而不是本地 fallback。由于 judge 不同，Retail 只能在同一 judge 组内做严格一些的相对比较；所有 tau2 结果也不能直接与使用官方 GPT-4.1 simulator/judge 的 leaderboard 横比。
+
+### 2.4 可比性限制
+
+1. BFCL 官方 score 文件中的模型标签统一为 `Qwen3-4B (FC)`，实际请求模型由 vLLM endpoint 和 served model ID 决定。旧基线产物仅凭标签不能证明与其它 benchmark 使用完全相同的 checkpoint，因此 BFCL 跨日期差值属于产物级比较。
+2. BFCL Overall 是官方按类别聚合的分数，不是对全部底层判分单元做简单微平均。
+3. tau2 只有 1 trial，且 user simulator 随被测模型变化；这既包含模型能力差异，也包含 self-play 轨迹波动。
+4. 08-13 与 08-20 两行是不同模型（Full-FT step 200 vs 原生权重），且 tau2 judge 配置不同，其差值不能解释为复现波动；原生基线目前只有 08-20 一次，没有重复运行可估计波动幅度。
+5. Lifelong 的 skill 标签可重叠，因此分技能统计不能相加得到总样本数。
+
+## 3. 主结果
+
+### 3.1 BFCL v3 leaderboard
+
+`Hall.` 对应 BFCL 汇总文件中的 `Irrelevance Detection`，表示不应调用工具时的识别能力。
+
+| Method | Non-Live | Live | Multi-Turn | Hall. | Overall |
+|---|---:|---:|---:|---:|---:|
+| Full-FT (08-13) | 75.37 | 76.28 | **51.12** | 80.97 | 67.59 |
+| Base native (08-20) | 81.03 | 77.34 | 44.50 | 81.86 | 67.63 |
+| LoRA r64/a128 (step 200) | 80.15 | 76.63 | 49.88 | 83.36 | **68.89** |
+| Independent ΔKV Prefix m2048 (step 203) | **81.87** | 78.05 | 45.88 | 83.75 | 68.60 |
+| Independent ΔKV Prefix m2048 largelr (step 203) | 78.33 | 73.66 | 43.75 | 75.09 | 65.19 |
+| Independent ΔKV Prefix m2048 largelr (step 180) | 78.33 | 74.01 | 46.25 | 78.76 | 66.50 |
+| Hybrid Δ+ResAttn Prefix G2048/A256 (step 180) | 79.81 | **78.23** | 46.38 | **83.77** | 68.65 |
+| Hybrid Δ+ResAttn Prefix G2048/A256 (step 200) | 80.17 | 78.14 | 46.25 | 83.02 | 68.62 |
+| Hybrid Δ+ResAttn Prefix G2048/A256 (step 203) | 80.12 | 77.74 | 47.25 | 83.41 | **68.89** |
+
+单位：%。Prefix（5e-6）的 Independent 变体在 Non-Live 最好（81.87），Hybrid 变体在 Live（78.23）与 Hallucination/Irrelevance（83.77）最好；BFCL Overall 最高为 LoRA 与 Hybrid step 203 并列（68.89）；Full-FT 的 Multi-Turn 最高（51.12，比原生 Base 的 44.50 高 6.62 pp）。largelr 两个 checkpoint 全面低于常规 LR run：step 203 Overall 65.19% 为主表最低，step 180 回升到 66.50% 但仍低于常规 run 与原生 Base。Hybrid 三个 checkpoint 的 BFCL Overall 在 68.62-68.89 之间，训练后期稳定无退化。
+
+### 3.2 tau2-bench
+
+粗体表示同一 judge 组内最佳。Overall 为 Airline 与 Retail 按样本数加权的 Pass@1。
+
+| Judge 组 | Method | Airline Pass@1 | Retail Pass@1 | Overall Pass@1 |
 |---|---|---:|---:|---:|
-| tau2-bench | Airline | 34/50（68.00%） | 32/50（64.00%） | -4.00 pp |
-| tau2-bench | Retail | 61/114（53.51%） | 69/114（60.53%） | +7.02 pp |
-| tau2-bench | 加权汇总 | 95/164（57.93%） | 101/164（61.59%） | +3.66 pp |
-| BFCL v3 | Overall Acc | 67.59% | 68.89% | +1.30 pp |
-| LifelongDB | test | 425/500（85.00%） | 416/500（83.20%） | -1.80 pp |
-| LifelongOS | test | 214/500（42.80%） | 233/500（46.60%） | +3.80 pp |
+| Historical local | Full-FT (08-13) | **68.00** (34/50) | 53.51 (61/114) | 57.93 (95/164) |
+| Historical local | LoRA r64/a128 (step 200) | 64.00 (32/50) | **60.53** (69/114) | **61.59** (101/164) |
+| Ark DeepSeek | Base native (08-20) | 58.00 (29/50) | 55.26 (63/114) | 56.10 (92/164) |
+| Ark DeepSeek | Independent ΔKV Prefix m2048 (step 203) | 68.00 (34/50) | 57.89 (66/114) | **60.98** (100/164) |
+| Ark DeepSeek | Independent ΔKV Prefix m2048 largelr (step 203) | 66.00 (33/50) | 50.88 (58/114) | 55.49 (91/164) |
+| Ark DeepSeek | Independent ΔKV Prefix m2048 largelr (step 180) | **70.00** (35/50) | 46.49 (53/114) | 53.66 (88/164) |
+| Ark DeepSeek | Hybrid Δ+ResAttn Prefix (step 180) | 64.00 (32/50) | 54.39 (62/114) | 57.32 (94/164) |
+| Ark DeepSeek | Hybrid Δ+ResAttn Prefix (step 200) | 62.00 (31/50) | **58.77** (67/114) | 59.76 (98/164) |
+| Ark DeepSeek | Hybrid Δ+ResAttn Prefix (step 203) | 66.00 (33/50) | 52.63 (60/114) | 56.71 (93/164) |
 
-LoRA 对 Retail、BFCL 和 LifelongOS 有正向收益，尤其是 Retail 与 OS；Airline 和 LifelongDB 略有回落。按 tau2 两个 domain 的样本数加权，整体提升 3.66 个百分点。
+在同日、同 judge 配置下，Prefix 相对原生 Base 多通过 8 条：Airline +5，Retail +3，Overall +4.88 pp。largelr 与常规 run 同组同日可比：step 203 Overall 掉 5.49 pp 且低于原生 Base；step 180 的 Airline 70.00 是全表最高，但 Retail 46.49 是全表最低，Overall 53.66 反而更差——largelr 两个 checkpoint 的 tau2 Overall 均明显低于常规 run。Hybrid 与常规 run 同 LR、同 judge 组但跨日（08-22 vs 08-20）：三步 Overall 57.32/59.76/56.71，均未超过常规 run 的 60.98；Retail 在 step 200 达到全表最高的 58.77，但 Airline 相对疲软（最高 66.00）。注意 Full-FT 与原生 Base 分属不同 judge 组，tau2 上不能直接横比。
 
-BFCL 对比需要额外谨慎：两次官方 score 文件都显示处理器标签 `Qwen3-4B (FC)`。本次生成请求实际发送到 LoRA endpoint，服务返回的模型根目录也已核对为上述 `huggingface_merged`；但旧 BFCL 产物仅凭标签无法证明与 tau2/Lifelong 基线 checkpoint 完全相同。因此 BFCL 的 +1.30 pp 可作为产物级对比，不应当作严格受控的同基座消融。
+### 3.3 LifelongAgentBench
 
-### 1.3 tau2-bench（LoRA，thinking 关闭）
+两个子集各 500 条。Macro Avg 是 DB 与 OS 通过率的简单平均，仅用于紧凑汇总。
 
-配置与基线一致：base split，1 trial，最大 50 steps，主运行 32 并发，agent/user 最大 4096 completion tokens；补跑使用 concurrency=1。
-
-- Airline：32/50，pass@1=64.00%。正常停止 43 条，达到 50-step 上限 7 条；DB reward 33/43（76.74%），communicate checks 5/7（71.43%）；read action 63/65（96.92%），write action 33/43（76.74%）。18 条失败包括 DB only 9、communicate only 1、DB + communicate 1、max steps 7。
-- Retail：69/114，pass@1=60.53%。正常停止 107 条，达到 50-step 上限 7 条；DB reward 70/107（65.42%），NL assertions 49/57（85.96%），communicate checks 55/58（94.83%）；read action 331/351（94.30%），write action 112/158（70.89%）。45 条失败包括 DB only 31、DB + NL assertion 6、NL assertion only 1、max steps 7。
-- 加权汇总：101/164，pass@1=61.59%。Airline 主运行因单条 HTTP 请求长期挂起保存了 49 条，Retail 主运行保存了 113 条；分别单独补跑 task 25 和 task 23 后，两个 domain 的 task ID 均完整且无重复。task 25 得分 0，task 23 得分 1。
-
-### 1.4 BFCL v3（LoRA）
-
-| 评测组 | 基线 | LoRA step 200 | 变化 |
+| Method | LifelongDB Pass@1 | LifelongOS Pass@1 | Macro Avg |
 |---|---:|---:|---:|
-| Overall Acc | 67.59% | 68.89% | +1.30 pp |
-| Non-Live Overall Acc | 75.37% | 80.15% | +4.78 pp |
-| Live Acc | 76.28% | 76.63% | +0.35 pp |
-| Multi-Turn Acc | 51.12% | 49.88% | -1.24 pp |
+| Full-FT (08-13) | 85.00 (425/500) | 42.80 (214/500) | 63.90 |
+| Base native (08-20) | 85.20 (426/500) | 44.20 (221/500) | 64.70 |
+| LoRA r64/a128 (step 200) | 83.20 (416/500) | **46.60** (233/500) | 64.90 |
+| Independent ΔKV Prefix m2048 (step 203) | 86.80 (434/500) | 42.40 (212/500) | 64.60 |
+| Independent ΔKV Prefix m2048 largelr (step 203) | 84.00 (420/500) | 43.40 (217/500) | 63.70 |
+| Independent ΔKV Prefix m2048 largelr (step 180) | 85.20 (426/500) | **46.60** (233/500) | **65.90** |
+| Hybrid Δ+ResAttn Prefix G2048/A256 (step 180) | 86.40 (432/500) | 43.60 (218/500) | 65.00 |
+| Hybrid Δ+ResAttn Prefix G2048/A256 (step 200) | **87.60** (438/500) | 41.80 (209/500) | 64.70 |
+| Hybrid Δ+ResAttn Prefix G2048/A256 (step 203) | 86.00 (430/500) | 42.00 (210/500) | 64.00 |
 
-LoRA 的 Non-Live Overall Acc 为 80.15%，其中 AST Summary 从基线 73.17% 提升到 78.21%（+5.04 pp）；Simple 63.83%、Multiple 92.50%、Parallel 72.00%、Parallel Multiple 84.50%，Python/Java/JavaScript Simple 分别为 86.50%/53.00%/52.00%。Live 的 Simple/Multiple/Parallel/Parallel Multiple 分别为 70.54%/76.83%/56.25%/70.83%。Multi-Turn 中 Base 60.00%、Miss Function 51.00%、Miss Parameter 37.50%、Long Context 51.00%；多轮总体相对基线略降，缺参恢复仍是主要短板。
+LifelongDB 最好为 Hybrid step 200 的 87.60（Independent 常规 run 的 86.80 次之）；LifelongOS 由 LoRA 与 largelr step 180 并列最高（46.60），Macro Avg 最高为 largelr step 180 的 65.90。largelr 从 step 180 到 step 203 两个子集同步下滑（DB -1.20、OS -3.20 pp）；Hybrid 的 DB 在 step 200 达峰后 step 203 回落 1.60 pp，OS 三步稳定在 41.80-43.60。所有 Lifelong 正式运行均为 0 runtime errors。
 
-### 1.5 Lifelong（LoRA）
+## 4. 细分诊断
 
-- LifelongDB：416/500，pass@1=83.20%，0 runtime errors。平均 2.628 steps；成功样本 2.308，失败样本 4.214。84 条失败中，最后动作为 `submit` 51 条、`execute` 30 条，另有 3 条未形成标准 action；36 条失败用满 6 steps。较弱技能仍包括 `delete` 28/56（50.00%）、`subquery_nested` 41/77（53.25%）、`table_alias` 67/109（61.47%）、`where_nested_conditions` 37/59（62.71%）。
-- LifelongOS：233/500，pass@1=46.60%，0 runtime errors。平均 6.454 steps；成功样本 5.777，失败样本 7.045。267 条失败中，最后仍为 `execute` 143 条、已调用 `finish` 124 条；183 条失败用满 8 steps。较弱技能包括 `gpasswd` 3/35（8.57%）、`addgroup` 29/118（24.58%）、`chgrp` 41/152（26.97%）、`useradd` 28/96（29.17%）。
+### 4.1 BFCL single-turn 与 multi-turn
 
-LoRA 没有改变两个 Lifelong 数据集的主要错误形态：DB 仍受精确提交格式、嵌套查询和数据库状态影响；OS 仍集中在用户/组/权限管理及多步骤任务收尾。但 OS 的绝对通过数增加 19 条，是本轮最明确的泛化收益之一。
+下表选取最能区分方法的 Non-Live AST 和 Multi-Turn 子类。粗体为列最佳。
 
-## 2. 基线结论汇总（2026-08-13）
+| Method | NL Simple | NL Multiple | NL Parallel | NL Parallel Multi | MT Base | MT Miss Func | MT Miss Param | MT Long Context |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Full-FT (08-13) | 57.67 | 94.00 | 62.50 | 78.50 | **62.50** | **52.50** | 35.00 | **54.50** |
+| Base native (08-20) | 66.83 | 92.50 | 74.00 | 86.00 | 54.50 | 40.00 | 33.50 | 50.00 |
+| LoRA r64/a128 (step 200) | 63.83 | 92.50 | 72.00 | 84.50 | 60.00 | 51.00 | **37.50** | 51.00 |
+| Independent ΔKV Prefix m2048 (step 203) | **66.92** | 93.50 | **75.00** | 86.00 | 56.00 | 43.50 | 36.00 | 48.00 |
+| Independent ΔKV Prefix m2048 largelr (step 203) | 61.33 | 92.50 | **75.00** | 84.50 | 51.50 | 45.00 | 30.50 | 48.00 |
+| Independent ΔKV Prefix m2048 largelr (step 180) | 63.83 | 92.50 | 72.00 | 85.00 | 53.50 | 46.50 | 34.50 | 50.50 |
+| Hybrid Δ+ResAttn Prefix (step 180) | 66.25 | 93.00 | 74.50 | 85.50 | 57.00 | 45.50 | 35.50 | 47.50 |
+| Hybrid Δ+ResAttn Prefix (step 200) | 66.67 | **94.50** | 74.00 | 85.50 | 57.00 | 45.50 | 36.50 | 46.00 |
+| Hybrid Δ+ResAttn Prefix (step 203) | 65.50 | 93.50 | **75.00** | **86.50** | 55.00 | 47.50 | 36.50 | 50.00 |
 
-| Benchmark | 子集 | 通过/总数 | 分数 | Runtime errors |
+主要模式很清楚：LoRA/Prefix 改善了多数 single-turn AST 指标，但没有稳定改善 multi-turn。`Miss Param` 都偏低，是最一致的 BFCL 短板；largelr step 203 把该短板进一步放大到 30.50，且 Hall.（75.09）相比常规 run（83.75）明显退化；step 180 部分回升（Miss Param 34.50、Hall. 78.76）但仍低于常规 run，说明更大 LR 让"不该调工具时别调"的行为变差、且后期继续恶化。Hybrid 三个 checkpoint 的 single-turn AST 全面达到或接近全表最佳（NL Multiple 94.50、NL Parallel Multi 86.50 为列最高），multi-turn 仍低于 Full-FT。
+
+### 4.2 tau2 终止与判分构成
+
+| Judge 组 | Method | Airline 正常/上限 | Airline DB | Retail 正常/上限 | Retail DB | Retail NL |
+|---|---|---:|---:|---:|---:|---:|
+| Historical local | Full-FT (08-13) | 46 / 4 | 34/46 (73.91%) | 106 / 8 | 63/106 (59.43%) | 46/57 (80.70%) |
+| Historical local | LoRA step 200 | 43 / 7 | 33/43 (76.74%) | 107 / 7 | 70/107 (65.42%) | 49/57 (85.96%) |
+| Ark DeepSeek | Base native (08-20) | 47 / 3 | 30/47 (63.83%) | 109 / 5 | 64/109 (58.72%) | 48/58 (82.76%) |
+| Ark DeepSeek | Prefix step 203 | 48 / 2 | 35/48 (72.92%) | 111 / 3 | 69/111 (62.16%) | 49/57 (85.96%) |
+| Ark DeepSeek | Prefix largelr step 203 | 46 / 4 | 33/46 (71.74%) | 106 / 8 | 63/106 (59.43%) | 46/57 (80.70%) |
+| Ark DeepSeek | Prefix largelr step 180 | 48 / 2 | 35/48 (72.92%) | 108 / 6 | 59/108 (54.63%) | 42/58 (72.41%) |
+| Ark DeepSeek | Hybrid Prefix step 180 | 46 / 4 | 33/46 (71.74%) | 106 / 8 | 64/106 (60.38%) | 48/55 (87.27%) |
+| Ark DeepSeek | Hybrid Prefix step 200 | 46 / 4 | 32/46 (69.57%) | 109 / 5 | 69/109 (63.30%) | 47/58 (81.03%) |
+| Ark DeepSeek | Hybrid Prefix step 203 | 45 / 5 | 34/45 (75.56%) | 109 / 5 | 67/109 (61.47%) | 44/59 (74.58%) |
+
+同日对比中，Prefix 的优势同时来自更少的 max-step 终止和更高的 DB match。原生 Base 的 Airline write-action match 为 27/47（57.45%），Prefix 为 33/48（68.75%）；Retail 分别为 108/162（66.67%）与 106/166（63.86%），说明 Retail 最终差异不能只用 write-action 命中率解释。largelr step 203 的 write-action match 为 Airline 32/49（65.31%）、Retail 94/157（59.87%），step 180 为 Airline 31/48（64.58%）、Retail 90/154（58.44%），均低于常规 run，且 largelr 的 Retail DB/NL 同步下滑（step 180 的 Retail NL 72.41% 为全表最低）。Hybrid 的 write-action match 明显更高：Airline 三步 30/45（66.67%）、34/48（70.83%）、34/47（72.34%），Retail 三步 106/156（67.95%）、107/160（66.88%）、102/158（64.56%）；其 Retail NL 在 step 180 达到 87.27%（全表最高），但 step 203 回落到 74.58%，tau2 跨步波动主要来自 Retail。
+
+### 4.3 Lifelong 轨迹形态
+
+| Method | DB 平均 steps | DB 失败末动作（submit / execute / 其它） | DB 失败用满 6 steps | OS 平均 steps | OS 失败末动作（finish / execute） | OS 失败用满 8 steps |
+|---|---:|---:|---:|---:|---:|---:|
+| Full-FT (08-13) | 2.604 | 58 / 17 / 0 | 17 | 6.308 | 142 / 144 | 178 |
+| Base native (08-20) | 2.596 | 46 / 28 / 0 | 34 | 6.418 | 116 / 163 | 202 |
+| LoRA step 200 | 2.628 | 51 / 30 / 3 | 36 | 6.454 | 124 / 143 | 183 |
+| Prefix step 203 | 2.660 | 42 / 24 / 0 | 33 | 6.410 | 124 / 164 | 205 |
+| Prefix largelr step 203 | 2.500 | 63 / 17 / 0 | 21 | 6.010 | 151 / 132 | 172 |
+| Prefix largelr step 180 | 2.480 | 56 / 18 / 0 | 20 | 6.020 | 155 / 112 | 154 |
+| Hybrid Prefix step 180 | 2.688 | 45 / 23 / 0 | 31 | 6.384 | 120 / 162 | 199 |
+| Hybrid Prefix step 200 | 2.668 | 39 / 23 / 0 | 32 | 6.414 | 126 / 165 | 206 |
+| Hybrid Prefix step 203 | 2.702 | 44 / 26 / 0 | 34 | 6.448 | 125 / 165 | 206 |
+
+DB 失败通常分为两类：已经 `submit` 但结果或最终数据库状态不匹配，以及达到上限仍停留在 `execute`。OS 失败也分为两类：未在上限前调用 `finish`，或调用 `finish` 后隐藏检查未通过。
+
+### 4.4 Lifelong 弱技能
+
+LifelongDB：
+
+| Method | `delete` | `subquery_nested` | `table_alias` | `where_nested_conditions` |
 |---|---:|---:|---:|---:|
-| tau2-bench | Airline | 34/50 | 68.00% | 0 |
-| tau2-bench | Retail | 61/114 | 53.51% | 0 |
-| tau2-bench | Airline + Retail（加权汇总） | 95/164 | 57.93% | 0 |
-| BFCL v3 (`Qwen3-4B FC`) | all（官方综合准确率） | — | 67.59% | — |
-| LifelongDB | test | 425/500 | 85.00% | 0 |
-| LifelongOS | test | 214/500 | 42.80% | 0 |
+| Full-FT (08-13) | 50.00 (28/56) | 53.25 (41/77) | 63.30 (69/109) | 62.71 (37/59) |
+| Base native (08-20) | 53.57 (30/56) | 55.84 (43/77) | 63.30 (69/109) | 66.10 (39/59) |
+| LoRA step 200 | 50.00 (28/56) | 53.25 (41/77) | 61.47 (67/109) | 62.71 (37/59) |
+| Prefix step 203 | 64.29 (36/56) | **64.94** (50/77) | **69.72** (76/109) | **71.19** (42/59) |
+| Prefix largelr step 203 | 50.00 (28/56) | 57.14 (44/77) | 60.55 (66/109) | 64.41 (38/59) |
+| Prefix largelr step 180 | **66.07** (37/56) | 62.34 (48/77) | 68.81 (75/109) | 59.32 (35/59) |
+| Hybrid Prefix step 180 | 58.93 (33/56) | 64.94 (50/77) | 66.97 (73/109) | 67.80 (40/59) |
+| Hybrid Prefix step 200 | 60.71 (34/56) | **67.53** (52/77) | **72.48** (79/109) | 66.10 (39/59) |
+| Hybrid Prefix step 203 | 57.14 (32/56) | 59.74 (46/77) | 66.06 (72/109) | 69.49 (41/59) |
 
-`qwen3.5-4b` 在结构化 SQL 任务上表现最好；tau2 多轮工具交互居中；LifelongOS 明显最弱，主要瓶颈是复杂 Linux 状态变更任务以及在步数上限前完成并调用 `finish`。BFCL 的 `Qwen3-4B (FC)` 综合准确率为 67.59%，单轮/Live function calling 较强，多轮 function calling 明显较弱。由于 BFCL 结果的模型标签不同，不应与 tau2/Lifelong 结果视作同一个 checkpoint 的横向能力切片。
+LifelongOS：
 
-## 3. 基线 tau2-bench（thinking 关闭）
+| Method | `gpasswd` | `chgrp` | `addgroup` | `useradd` |
+|---|---:|---:|---:|---:|
+| Full-FT (08-13) | **14.29** (5/35) | 20.39 (31/152) | 24.58 (29/118) | 28.13 (27/96) |
+| Base native (08-20) | 8.57 (3/35) | 24.34 (37/152) | 25.42 (30/118) | **32.29** (31/96) |
+| LoRA step 200 | 8.57 (3/35) | **26.97** (41/152) | 24.58 (29/118) | 29.17 (28/96) |
+| Prefix step 203 | 5.71 (2/35) | 23.03 (35/152) | 23.73 (28/118) | 26.04 (25/96) |
+| Prefix largelr step 203 | 8.57 (3/35) | 23.03 (35/152) | 23.73 (28/118) | 30.21 (29/96) |
+| Prefix largelr step 180 | 8.57 (3/35) | 25.00 (38/152) | **29.66** (35/118) | 31.25 (30/96) |
+| Hybrid Prefix step 180 | 5.71 (2/35) | 23.03 (35/152) | 22.03 (26/118) | 28.12 (27/96) |
+| Hybrid Prefix step 200 | 5.71 (2/35) | 22.37 (34/152) | 22.88 (27/118) | 23.96 (23/96) |
+| Hybrid Prefix step 203 | 5.71 (2/35) | 20.39 (31/152) | 22.03 (26/118) | 26.04 (25/96) |
 
-配置：base split，1 trial，最大 50 steps，32 并发，agent/user 最大 4096 completion tokens。Agent、user simulator 和 Retail 自然语言断言 judge 均通过 `enable_thinking=false` 关闭 thinking。
+Prefix 对 DB 的 DELETE、嵌套查询和复杂 WHERE 有稳定收益；largelr step 180 在 `delete`/`table_alias`/`addgroup` 上接近或超过常规 run，说明高 LR 的技能收益一度存在，但到 step 203 又回落（step 203 的 DB 弱技能被抹平到 Full-FT/LoRA 水平）。Hybrid step 200 的 `subquery_nested`（67.53）与 `table_alias`（72.48）为全表最高，DB 弱技能收益与常规 run 相当或更好；其 OS 弱技能与其它 prefix 变体一样疲软（`gpasswd` 三步均为 5.71）。OS 的用户/组/权限管理整体没有对应提升。OS 后续训练更适合加入 `id`、`getent`、`stat`、`readlink` 等执行后验证轨迹，并强调在最后一步调用 `finish`。
 
-### Airline
+## 5. 结论
 
-- 最终：34/50，pass@1=68.00%。
-- 正常停止 46 条；达到 50-step 上限 4 条。
-- DB match：34/46（73.91%，达到 max steps 的 4 条没有 DB 判分）。
-- Communicate checks：7/10（70.00%）。
-- 工具动作匹配：read 77/82（93.90%），write 31/48（64.58%）。
-- 16 条失败构成：DB only 9；DB + communicate 3；max steps 4。
-- 首次全量有任务 42 的 HTTP 请求异常挂起，因此原目录保存 49 条；任务 42 后续单独补跑完成且得分 0，最终 50 条 task ID 完整、无重复。
+1. **Prefix 系方法最适合当前的数据库与 single-turn function-calling 目标。** Independent 变体取得最佳 BFCL Non-Live（81.87），Hybrid 变体取得最佳 Live（78.23）、Hall.（83.77）与最佳 LifelongDB（87.60，step 200），两者在同 judge 的 tau2 对比中均明显超过原生 Base；Hybrid 的 BFCL Overall（68.89，step 203）追平 LoRA 的全表最高。
+2. **LoRA 的优势集中在 LifelongOS，BFCL Overall 已被追平。** 其 LifelongOS 46.60% 与 largelr step 180 并列最高；BFCL Overall 68.89% 与 Hybrid step 203 并列最高。
+3. **Multi-turn 是 LoRA/Prefix 相对 Full-FT 的短板。** 两者的 BFCL Multi-Turn 均未超过 Full-FT 的 51.12（原生 Base 为 44.50），提示全参数更新对多轮能力有帮助而 LoRA/Prefix 未能复制；`Miss Param` 尤其弱。
+4. **08-13 的"Base"实为 Full-FT step 200，原生基线只有 08-20 一次。** 原先"两次 Base 差值=复现波动"的解读作废：两者 BFCL Overall 仅差 0.04 pp，但那是 Full-FT 与原生模型恰好接近，不代表评测稳定；Multi-Turn 上两者相差 6.62 pp 属于方法差异。原生模型目前没有重复评测。
+5. **下一轮训练建议拆分目标。** DB/单轮 tool use 可优先沿用 Prefix；OS/多步骤 agent 可针对权限管理、执行后验证和 finish 时机单独构造数据，而不是只扩大通用 function-calling 数据。
+6. **largelr（5e-5）训练后期确认退化，但问题不止"训多了"。** 同一 largelr run，step 180 -> step 203 在 5 个 benchmark 家族中 4 个下滑：BFCL Overall 66.50 -> 65.19、Hall. 78.76 -> 75.09、LifelongDB 85.20 -> 84.00、LifelongOS 46.60 -> 43.40（tau2 Airline 也 -4.00 pp，仅 Retail +4.39 pp），且训练侧 on-policy score 平稳（~0.80）、distill loss 缓慢下降并无告警，符合"held-out 退化而训练指标无感"的过拟合特征。但更关键的是：即使取较优的 step 180，largelr 的 BFCL Overall（66.50）、tau2 Overall（53.66）、LifelongDB（85.20）仍全面低于 5e-6 常规 run 的 step 203（68.60 / 60.98 / 86.80），仅 LifelongOS（46.60）和 Macro Avg（65.90）占优。结论：5e-5 的主要问题是 LR 本身偏大，后期过拟合是次生问题；prefix LR 应保持 5e-6 量级，或配合更早停止（< step 180）/更强正则再试高 LR。
+7. **Hybrid（ΔKV + full-attention residual prefix）在 5e-6 下训练稳定，是当前最均衡的 prefix 变体。** 三个 checkpoint（180/200/203）的 BFCL Overall 稳定在 68.62-68.89（step 203 追平 LoRA 全表最高），single-turn AST 子类达到或接近全表最佳，LifelongDB 在 step 200 创全表新高 87.60，tau2 Retail step 200 亦为全表最高（58.77）；与同 LR 的 Independent 常规 run 相比，tau2 Overall 略低（59.76 vs 60.98）、LifelongOS 无优势。给 full-attention 层加 prefix 的增益集中在 single-turn AST 与 DB 技能，未改善 multi-turn 与 OS。
 
-### Retail
-
-- 最终：61/114，pass@1=53.51%。
-- 正常停止 106 条；达到 50-step 上限 8 条。
-- DB match：63/106（59.43%）。
-- NL assertions：46/57（80.70%）。
-- Communicate checks：49/56（87.50%）。
-- 工具动作匹配：read 297/322（92.24%），write 111/160（69.38%）。
-- 53 条失败构成：DB only 38；DB + NL assertion 5；NL assertion only 2；max steps 8。
-
-### 可比性说明
-
-本次只提供了本地 `qwen3.5-4b` 服务，因此 tau2 的 user simulator 和 Retail NL-assertion judge 也路由到该模型；官方源码默认二者使用 GPT-4.1。故本报告适合本地模型迭代对比，但 Retail 分数不能直接与使用官方 GPT-4.1 simulator/judge 的 leaderboard 数值横向比较。Airline 本次没有 NL assertion，受 judge 差异影响较小，但 user simulator 仍不同。
-
-## 4. 基线 BFCL v3
-
-BFCL 原始 score 目录中的官方模型标签为 `Qwen3-4B (FC)`。总体分数是 BFCL 官方按类别聚合得到的准确率，不是简单的“正确数/全部底层判分单元”微平均，因此汇总表不填写统一分子和分母。
-
-| 评测组 | 官方分数 |
-|---|---:|
-| Overall Acc | 67.59% |
-| Non-Live Overall Acc | 75.37% |
-| Live Overall Acc | 76.28% |
-| Multi-Turn Overall Acc | 51.12% |
-
-### Non-Live
-
-- AST Summary：73.17%。
-- Simple AST：57.67%；其中 Python 83.00%（332/400）、Java 44.00%（44/100）、JavaScript 46.00%（23/50）。
-- Multiple AST：94.00%（188/200）。
-- Parallel AST：62.50%（125/200）。
-- Parallel Multiple AST：78.50%（157/200）。
-- Irrelevance Detection：84.17%（202/240）。
-
-### Live
-
-- Overall Acc：76.28%；AST Summary：75.28%。
-- Simple AST：70.54%（182/258）。
-- Multiple AST：77.02%（811/1053）。
-- Parallel AST：50.00%（8/16）。
-- Parallel Multiple AST：66.67%（16/24）。
-- Irrelevance Detection：77.78%（686/882）。
-- Relevance Detection：77.78%（14/18）。
-
-### Multi-Turn
-
-- Overall Acc：51.12%。
-- Base：62.50%（125/200）。
-- Miss Function：52.50%（105/200）。
-- Miss Parameter：35.00%（70/200），是 BFCL 最明显的短板。
-- Long Context：54.50%（109/200）。
-
-BFCL 的核心改进方向是 multi-turn 参数缺失恢复、长上下文中的函数状态维护，以及 Java/JavaScript simple function calling。优势集中在 Non-Live Multiple AST 和 Python Simple AST。
-
-## 5. 基线 LifelongDB
-
-配置：test 500 条，最大 6 steps，16 并发，MySQL 8.0，最大 2048 completion tokens；成功由环境精确判分。
-
-- 最终：425/500，pass@1=85.00%，0 runtime errors。
-- 平均 steps：全部 2.604；成功样本 2.351；失败样本 4.040。
-- 75 条失败中：58 条已 `submit` 但结果/数据库状态不匹配；17 条用满 6 steps 仍停留在 `execute`、未提交。
-- 较弱技能（标签可重叠，括号为成功/总数）：`delete` 28/56（50.00%）、`subquery_nested` 41/77（53.25%）、`where_nested_conditions` 37/59（62.71%）、`table_alias` 69/109（63.30%）、`subquery_multiple` 38/57（66.67%）。
-- 较强技能：`order_by_multiple_columns_same_direction` 56/57（98.25%）、`having_single_condition_with_aggregate` 96/100（96.00%）、`order_by_single_column` 49/52（94.23%）、`group_by_single_column` 110/117（94.02%）。
-
-主要改进方向是嵌套/多子查询、DELETE，以及提交结果的精确格式与最终数据库状态验证。
-
-## 6. 基线 LifelongOS
-
-配置：test 500 条，最大 8 steps，16 并发，单条 shell 命令超时 20 秒，LLM step 超时 180 秒，最大 2048 completion tokens；成功由容器内隐藏检查脚本判定。
-
-- 最终：214/500，pass@1=42.80%，0 runtime errors。
-- 平均 steps：全部 6.308；成功样本 5.528；失败样本 6.892。
-- 219/500 条运行到第 8 step；失败样本中 178/286 条运行到第 8 step。
-- 286 条失败中：144 条达到上限时最后仍为 `execute`、未调用 `finish`；142 条调用了 `finish`，但隐藏环境检查未通过。
-- 最弱技能（标签可重叠）：`gpasswd` 5/35（14.29%）、`chage` 5/32（15.63%）、`chgrp` 31/152（20.39%）、`usermod` 30/129（23.26%）、`addgroup` 29/118（24.58%）、`useradd` 27/96（28.13%）。
-- 相对较强技能：`sleep` 35/48（72.92%）、`exit` 30/45（66.67%）、`chsh` 25/43（58.14%）、`rm` 56/102（54.90%）。
-
-核心短板集中在用户/组/权限生命周期管理，以及多步骤任务的收尾验证。建议训练时加入“执行后检查（`stat`/`id`/`getent`/`readlink` 等）再 finish”的轨迹，并针对 user/group 管理命令增加高覆盖样本。
-
-## 7. 运行环境与版本
-
-- 8 × NVIDIA A800-SXM4-80GB（每卡 81920 MiB）
-- vLLM 0.18.0，data parallel size=8
-- Python 3.11.15
-- PyTorch 2.10.0+cu128，CUDA runtime 12.8
-- Docker 29.1.3
-- self_evolver base commit：`39a7cead4374dbf4744d4e0ea59f93b62e130939`（评测时 worktree 含既有本地改动）
-- tau2 official commit：`363133ada1936491fb5bcec33cd62c3518a99f65`
-- LifelongAgentBench commit：`d6f19b42eb358d9150379f0c68c2985c5a867520`
-
-本次评测新增两项本地集成调整：tau2 允许通过环境变量覆盖 NL-assertion judge 并由统一入口传入本地模型/think-off 参数；LifelongOS Dockerfile 仅将 Ubuntu apt 源替换为清华镜像以完成依赖安装，任务所需 apt 索引予以保留。
-
-## 8. 正式原始产物
+## 6. 正式产物
 
 服务器根目录：`/mnt/storage/disk3/self_evolver`
 
-LoRA step 200：
+### 6.1 Full-FT step 200（08-13，曾误记为 Base）
 
-- 合并模型：`checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_lora_r64_a128/global_step_200/actor/huggingface_merged/`
-- tau2 Airline 主运行（49 条）：`workspace/eval_logs/tau2/airline/lora_r64_a128_step200_full_20260817_1120/results.json`
-- tau2 Airline task 25 补跑：`workspace/eval_logs/tau2/airline/lora_r64_a128_step200_retry25_20260817_1142/results.json`
-- tau2 Retail 主运行（113 条）：`workspace/eval_logs/tau2/retail/lora_r64_a128_step200_full_20260817_1120/results.json`
-- tau2 Retail task 23 补跑：`workspace/eval_logs/tau2/retail/lora_r64_a128_step200_retry23_20260817_1142/results.json`
-- BFCL v3 生成结果与 score：`workspace/eval_logs/bfcl_v3/all/lora_r64_a128_step200_20260817_1120/`
-- LifelongDB：`workspace/eval_logs/lifelong_db/test/lora_r64_a128_step200_full_20260817_1120/`
-- LifelongOS：`workspace/eval_logs/lifelong_os/test/lora_r64_a128_step200_full_20260817_1120/`
-
-基线：
-
-- tau2 Airline 主运行（49 条）：`workspace/eval_logs/tau2/airline/qwen35_4b_thinkoff_full_20260813_130315/results.json`
+- 评测时端点实际加载的模型：`checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_fix_context/global_step_200/actor/huggingface_merged/`
+- 训练脚本：`verl/examples/on_policy_distillation_trainer/run_qwen3_5_4b_awm_opsd_full.sh`（FSDP2 world size 6，run name `qwen3_5_4b_awm_opsd_fix_context`）
+- tau2 Airline 主运行：`workspace/eval_logs/tau2/airline/qwen35_4b_thinkoff_full_20260813_130315/results.json`
 - tau2 Airline task 42 补跑：`workspace/eval_logs/tau2/airline/qwen35_4b_thinkoff_retry42_20260813_1319/results.json`
 - tau2 Retail：`workspace/eval_logs/tau2/retail/qwen35_4b_thinkoff_full_clean_20260813_1319/results.json`
-- BFCL v3 原始生成结果：`workspace/eval_logs/bfcl_v3/all/20260813_120100/result/Qwen_Qwen3-4B-FC/`
-- BFCL v3 官方 score 与汇总 CSV：`workspace/eval_logs/bfcl_v3/all/20260813_120100/score/`
+- BFCL v3：`workspace/eval_logs/bfcl_v3/all/20260813_120100/`
 - LifelongDB：`workspace/eval_logs/lifelong_db/test/qwen35_4b_full_20260813_130944/`
 - LifelongOS：`workspace/eval_logs/lifelong_os/test/qwen35_4b_full_clean_20260813_132859/`
 
-每个 Lifelong 目录包含 `summary.csv` 和逐任务 `trajectories/*.json`；tau2 `results.json` 包含任务、完整对话轨迹、reward breakdown 和终止原因；BFCL `result/` 保存逐条生成结果，`score/` 保存逐类别判分与 `data_overall.csv` 等官方汇总。
+### 6.2 Base native (08-20)
 
-## 9. 排除的运行与补跑说明
+- 评测权重：`/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B`（原生，未改动）
+- tau2 Airline：`workspace/eval_logs/tau2/airline/native_qwen35_4b_rerun_20260820/results.json`
+- BFCL v3：`workspace/eval_logs/bfcl_v3/all/native_qwen35_4b_rerun_20260820/`
+- LifelongDB：`workspace/eval_logs/lifelong_db/test/native_qwen35_4b_rerun_20260820/`
+- LifelongOS：`workspace/eval_logs/lifelong_os/test/native_qwen35_4b_rerun_20260820/`
 
-- tau2 Retail 初次运行因 NL judge 仍指向官方默认 GPT-4.1 而中止；修复为本地 judge 后从头重跑，初次部分结果不计分。
-- LifelongOS `qwen35_4b_full_20260813_132600` 在 87 条时发现镜像 apt 索引被清理，造成 `os_90` 初始化无法安装 zsh；该部分运行已排除。恢复 apt 索引后先验证 `os_90` 通过，再从头生成上述 `full_clean` 500 条正式结果。
-- LoRA tau2 主运行各有一条请求在高并发 BFCL/Lifelong 同时运行期间长期挂起。终止两个 tau2 主进程后，仅对缺失的 Airline task 25 与 Retail task 23 以 concurrency=1 补跑；最终聚合严格按 task ID 去重，50/50 与 114/114 均完整。
+### 6.3 LoRA step 200
+
+- 合并模型：`checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_lora_r64_a128/global_step_200/actor/huggingface_merged/`
+- tau2 Airline 主运行：`workspace/eval_logs/tau2/airline/lora_r64_a128_step200_full_20260817_1120/results.json`
+- tau2 Airline task 25 补跑：`workspace/eval_logs/tau2/airline/lora_r64_a128_step200_retry25_20260817_1142/results.json`
+- tau2 Retail 主运行：`workspace/eval_logs/tau2/retail/lora_r64_a128_step200_full_20260817_1120/results.json`
+- tau2 Retail task 23 补跑：`workspace/eval_logs/tau2/retail/lora_r64_a128_step200_retry23_20260817_1142/results.json`
+- BFCL v3：`workspace/eval_logs/bfcl_v3/all/lora_r64_a128_step200_20260817_1120/`
+- LifelongDB：`workspace/eval_logs/lifelong_db/test/lora_r64_a128_step200_full_20260817_1120/`
+- LifelongOS：`workspace/eval_logs/lifelong_os/test/lora_r64_a128_step200_full_20260817_1120/`
+
+### 6.4 Independent ΔKV Prefix step 203
+
+- 输入 checkpoint：`checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_independent_delta_kv_prefix_m2048/global_step_203/actor/`
+- CPU 合并模型：`/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B-IndependentDeltaKVPrefix-step203/`
+- 合并清单：`/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B-IndependentDeltaKVPrefix-step203/prefix_merge_manifest.json`
+- tau2 Airline：`workspace/eval_logs/tau2/airline/independent_delta_kv_prefix_m2048_step203_20260820/results.json`
+- tau2 Retail：`workspace/eval_logs/tau2/retail/independent_delta_kv_prefix_m2048_step203_20260820/results.json`
+- BFCL v3：`workspace/eval_logs/bfcl_v3/all/independent_delta_kv_prefix_m2048_step203_20260820/`
+- LifelongDB：`workspace/eval_logs/lifelong_db/test/independent_delta_kv_prefix_m2048_step203_20260820/`
+- LifelongOS：`workspace/eval_logs/lifelong_os/test/independent_delta_kv_prefix_m2048_step203_20260820/`
+
+### 6.5 Independent ΔKV Prefix largelr step 203
+
+- 输入 checkpoint：`checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_independent_delta_kv_prefix_largelr/global_step_203/actor/`
+- 训练脚本：`verl/examples/on_policy_distillation_trainer/run_qwen3_5_4b_awm_opsd_independent_delta_kv_prefix_m2048.sh`（`ACTOR_LR=5e-5`，run name `qwen3_5_4b_awm_opsd_independent_delta_kv_prefix_largelr`）
+- CPU 合并模型：`/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B-IndependentDeltaKVPrefix-largelr-step203/`
+- 合并清单：`/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B-IndependentDeltaKVPrefix-largelr-step203/prefix_merge_manifest.json`
+- tau2 Airline：`workspace/eval_logs/tau2/airline/independent_delta_kv_prefix_largelr_step203_20260821/results.json`
+- tau2 Retail：`workspace/eval_logs/tau2/retail/independent_delta_kv_prefix_largelr_step203_20260821/results.json`
+- BFCL v3：`workspace/eval_logs/bfcl_v3/all/independent_delta_kv_prefix_largelr_step203_20260821/`
+- LifelongDB：`workspace/eval_logs/lifelong_db/test/independent_delta_kv_prefix_largelr_step203_20260821/`
+- LifelongOS：`workspace/eval_logs/lifelong_os/test/independent_delta_kv_prefix_largelr_step203_20260821/`
+
+### 6.6 Independent ΔKV Prefix largelr step 180（过拟合复查）
+
+- 输入 checkpoint：`checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_independent_delta_kv_prefix_largelr/global_step_180/actor/`
+- CPU 合并模型：`/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B-IndependentDeltaKVPrefix-largelr-step180/`（含 `prefix_merge_manifest.json`）
+- 训练日志（用于核对 on-policy score / distill loss 曲线）：`wandb/run-20260820_123834-3dcqorfr/files/output.log`
+- tau2 Airline：`workspace/eval_logs/tau2/airline/independent_delta_kv_prefix_largelr_step180_20260821/results.json`
+- tau2 Retail：`workspace/eval_logs/tau2/retail/independent_delta_kv_prefix_largelr_step180_20260821/results.json`
+- BFCL v3：`workspace/eval_logs/bfcl_v3/all/independent_delta_kv_prefix_largelr_step180_20260821/`
+- LifelongDB：`workspace/eval_logs/lifelong_db/test/independent_delta_kv_prefix_largelr_step180_20260821/`
+- LifelongOS：`workspace/eval_logs/lifelong_os/test/independent_delta_kv_prefix_largelr_step180_20260821/`
+
+### 6.7 Hybrid Δ + Residual Attention Prefix G2048/A256（step 180/200/203）
+
+- 输入 checkpoint：`checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_hybrid_delta_residual_attention_prefix_g2048_a256/global_step_{180,200,203}/actor/`（run 内仅这三个 step 含完整 actor 权重，其余 step 目录只有 `data.pt`）
+- 训练脚本：`verl/examples/on_policy_distillation_trainer/run_qwen3_5_4b_awm_opsd_hybrid_delta_residual_attention_prefix_g2048_a256.sh`（prefix LR `5e-6`，FSDP2 world size 6）
+- CPU 导出模型：`/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B-HybridDeltaResidualAttentionPrefix-G2048-A256-step{180,200,203}/`（96 个 ΔKV tensors + 16 个 attention tensors，共 315,621,376 个 prefix 参数，各含 `prefix_merge_manifest.json`）
+- vLLM 服务日志：`workspace/eval_logs/vllm_server/hybrid_prefix_g2048_a256_step{180,200,203}_vllm.log`
+- tau2 Airline：`workspace/eval_logs/tau2/airline/hybrid_delta_residual_attention_prefix_g2048_a256_step{180,200,203}_20260822/results.json`
+- tau2 Retail：`workspace/eval_logs/tau2/retail/hybrid_delta_residual_attention_prefix_g2048_a256_step{180,200,203}_20260822/results.json`
+- BFCL v3：`workspace/eval_logs/bfcl_v3/all/hybrid_delta_residual_attention_prefix_g2048_a256_step{180,200,203}_20260822/`
+- LifelongDB：`workspace/eval_logs/lifelong_db/test/hybrid_delta_residual_attention_prefix_g2048_a256_step{180,200,203}_20260822/`
+- LifelongOS：`workspace/eval_logs/lifelong_os/test/hybrid_delta_residual_attention_prefix_g2048_a256_step{180,200,203}_20260822/`
+
+每个 Lifelong 目录包含 `summary.csv` 与 `trajectories/*.json`；tau2 `results.json` 包含任务、完整对话、reward breakdown 和终止原因；BFCL `result/` 保存生成结果，`score/` 保存逐类别判分与官方汇总 CSV。
+
+## 7. 运行与补跑记录
+
+- Full-FT (08-13) tau2 Airline 主运行缺 task 42，后以 concurrency=1 补跑；最终 50 个 task ID 完整且无重复。
+- Full-FT (08-13) LifelongOS 的早期运行 `qwen35_4b_full_20260813_132600` 因镜像 apt 索引问题被排除；修复后从头得到 `full_clean` 500 条正式结果。
+- LoRA tau2 主运行分别缺 Airline task 25 与 Retail task 23，均以 concurrency=1 补跑；聚合时按 task ID 去重，最终 50/50 与 114/114 完整。
+- Prefix 和 Base native (08-20) 的 BFCL、tau2、LifelongDB、LifelongOS 均一次完整结束，无 task 级补跑。
+- Prefix largelr (08-21) 的 BFCL、tau2（Airline 50/50、Retail 114/114 完整）、LifelongDB、LifelongOS 均一次完整结束，无 task 级补跑，Lifelong 两个子集 0 runtime errors。
+- Prefix largelr step 180 复查（08-21 下午）同样四项全量一次完整结束：tau2 50/50 与 114/114 完整，Lifelong 两个子集 500/500、0 runtime errors，无补跑。
+- Hybrid Prefix（08-22）三个 step 各自四项全量一次完整结束（step 180/200/203 依次评测，每个 step 重启一次 vLLM 服务）：tau2 均 50/50 与 114/114 完整，Lifelong 两个子集均 500/500、0 runtime errors，无补跑。
+- BFCL multi-turn 中的空响应或解析失败由官方 runner 捕获并按失败计分，没有人工修改生成或 score。
+
+## 8. 版本信息
+
+- **2026-08-21 勘误**：核实 08-13 评测的 vLLM 端点实际加载的是全参数微调 checkpoint `qwen3_5_4b_awm_opsd_fix_context/global_step_200/actor/huggingface_merged/`（该导出完成于 08-13 11:50，BFCL 评测 12:01 启动），而非原生 `/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B`（自 06-07 下载后未改动）。全文原 "Base (08-13)" 改为 "Full-FT (step 200, 08-13)"，"Base rerun (08-20)" 改为 "Base native (08-20)"；数值本身不变，仅口径与解读更正。
+- 2026-08-21 largelr 评测时 self_evolver HEAD：`c2ae941cdfb40c49645a762fc80140e65d613c17`（同 08-20），worktree 含既有本地修改；vLLM/评测管线与 08-20 完全一致，仅更换加载权重与 served model ID。
+- 2026-08-22 Hybrid 评测时 self_evolver HEAD 同为 `c2ae941cdfb40c49645a762fc80140e65d613c17`（worktree 含 hybrid prefix 实现的本地未提交文件）；vLLM/评测管线与之前完全一致，仅更换加载权重与 served model ID。Hybrid 使用专用导出脚本 `prefix_tuning/virtual_prefix/export_hybrid_delta_residual_attention_prefix_checkpoint.py`（统一 merger 尚未收录该类型）。
+- 2026-08-20 评测时 self_evolver HEAD：`c2ae941cdfb40c49645a762fc80140e65d613c17`，worktree 含既有本地修改。
+- 2026-08-13 报告记录的 self_evolver base commit：`39a7cead4374dbf4744d4e0ea59f93b62e130939`。
+- tau2 official commit：`363133ada1936491fb5bcec33cd62c3518a99f65`。
+- LifelongAgentBench 上游快照记录：`d6f19b42eb358d9150379f0c68c2985c5a867520`。

@@ -131,22 +131,48 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 f"checkpoint={state_order}, configured={self.trainable_param_order}"
             )
         parameters = {
-            name: {"shape": list(value.shape), "numel": int(value.numel())}
+            name: {
+                "shape": list(value.shape),
+                "numel": int(value.numel()),
+                "dtype": str(value.dtype),
+            }
             for name, value in state_dict.items()
         }
         unwrap = getattr(self.model, "_fsdp_wrapped_module", self.model)
         config = getattr(unwrap, "config", None)
         text_config = getattr(config, "text_config", config)
-        return {
+        independent_delta_tokens = getattr(
+            text_config, "independent_delta_prefix_num_virtual_tokens", None
+        )
+        residual_attention_tokens = getattr(
+            text_config, "residual_attention_prefix_num_virtual_tokens", None
+        )
+        if independent_delta_tokens is not None and residual_attention_tokens is not None:
+            trainable_type = "hybrid_delta_residual_attention_prefix"
+            num_virtual_tokens = independent_delta_tokens
+        elif independent_delta_tokens is not None:
+            trainable_type = "independent_delta_kv_prefix"
+            num_virtual_tokens = independent_delta_tokens
+        elif getattr(text_config, "delta_prefix_num_virtual_tokens", None) is not None:
+            trainable_type = "delta_virtual_prefix"
+            num_virtual_tokens = text_config.delta_prefix_num_virtual_tokens
+        else:
+            trainable_type = "selected_parameters"
+            num_virtual_tokens = None
+        metadata = {
             "checkpoint_type": "trainable_only",
+            "trainable_type": trainable_type,
             "world_size": self.world_size,
             "base_model_path": self.base_model_path,
-            "num_virtual_tokens": getattr(text_config, "delta_prefix_num_virtual_tokens", None),
+            "num_virtual_tokens": num_virtual_tokens,
             "parameter_names": list(state_order),
             "parameter_count": len(parameters),
             "total_numel": sum(item["numel"] for item in parameters.values()),
             "parameters": parameters,
         }
+        if residual_attention_tokens is not None:
+            metadata["attention_num_virtual_tokens"] = residual_attention_tokens
+        return metadata
 
     def _load_trainable_only_meta(self, local_path: str) -> Optional[dict]:
         path = self._trainable_only_meta_path(local_path)
