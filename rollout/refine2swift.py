@@ -1,47 +1,13 @@
-"""Convert a rollout.refine JSONL into a swift OPSD dataset (GKD online).
+"""Convert refine records into one Swift OPSD row per useful task.
 
-Student and teacher share the SAME prefix; the only difference is that the
-teacher's conversation has the privileged info appended at the END (after the
-trailing user note), while the student's does not. swift's OPSD
-``build_teacher_view`` replaces the LAST user message of ``messages`` with the
-``teacher_prompt`` string, so every row's ``messages`` must end in a user turn.
+Kept categories:
+  * complete_first_try: clean task prefix + a results-free reference plan.
+  * complete_after_refine: the immediately preceding attempt + its advice.
+  * improved_partial: the same transition shape with its real partial score.
 
-Two success cases are emitted, symmetric in shape:
-
-  hard-success (round-1 failed, advice injected, eventual success):
-      student messages:
-          system(agent prompt)
-          user(task / question)
-          ... round-1 history ...
-          user("[Round 1 failed] environment reset note")
-      teacher_prompt:
-          "[Expert advice]\n# Advice: <advice>\n\n" + env-reset note
-
-  first-attempt success (solved round 1, no advice):
-      student messages:
-          system(agent prompt)
-          user(task / question)              # CLEAN restart — no round-1 history
-      teacher_prompt:
-          "[Reference plan]\n<step-grouped tool-CALL plan (parallel-aware), no results/answer>\n\n" + task text
-
-For first-attempt cases the student restarts from a clean [system, task] context
-and re-solves on-policy (replaying the already-solved round-1 trajectory into the
-student would make the model "see" it is done and stop calling tools). The
-winning round-1 trajectory becomes the TEACHER's privileged plan, but rendered as
-the ORDERED TOOL CALLS ONLY — no tool results, no final answer. Handing the
-teacher the results/answer signals "task already complete", which distils the
-student into a "think-and-declare-done, never act" collapse (observed: tool-call
-rate fell to ~0% and num_turns→1 across training). A results-free plan instead
-tells the teacher WHICH tools to call in WHAT order while forcing it (and thus
-the student) to actually execute them and read the real responses. Both cases
-carry ``verify_reward_type="complete"``.
-
-The OpenAI-native tool-call turns produced by rollout.refine (assistant with a
-`tool_calls` list, string `arguments`, ids; `role:tool` results) are converted
-to swift's native agent format (`tool_call` / `tool_response` roles, arguments
-as dicts, ids dropped) so swift's `agent_template` (e.g. hermes) can render
-them. Each row also carries a `tools` JSON string with the scenario's tool
-schemas, fetched live from the AWM env.
+For multi-round records, the advice and trajectory always come from the round
+immediately before the selected target round. Verifier/reset failures,
+checker errors, missing advice, and non-improving partial attempts are dropped.
 
 Run:
     cd /mnt/storage/disk3/self_evolver && python -m rollout.refine2swift \
@@ -56,11 +22,12 @@ import argparse
 import asyncio
 import copy
 import json
+import math
 import re
-from tqdm import tqdm
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
-ADVICE_MARKER = "[Expert advice]"
+from tqdm import tqdm
 
 # Tells the student the env is being reset after a failed first round.
 ENV_RESET_NOTE = "Notice: Your first tried failed and the environment has been reset to its initial state. please try again."
@@ -85,6 +52,13 @@ _TRAJECTORY_HINT_BLOCK = (
     "{trajectory}"
 )
 
+_CODE_REFERENCE_BLOCK = (
+    "[Reference solution]\n"
+    "The following submission passed every hidden test. Use it as privileged "
+    "evidence to derive a correct solution for the user question.\n\n"
+    "{solution}"
+)
+
 # A tool result is a dead-end (drop its call from the plan) when it reports an
 # error / non-2xx status. The plan should list only the CLEAN expert path, not
 # the model's abandoned wrong guesses (e.g. a 422 int_parsing). We read results
@@ -97,13 +71,6 @@ _TRAJ_ERROR_RE = re.compile(r"error|status code:\s*[45]\d\d", re.IGNORECASE)
 
 def _is_error_result(text: str) -> bool:
     return bool(_TRAJ_ERROR_RE.search(text or ""))
-
-_THINK_BLOCK_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
-
-def strip_think(text: str) -> str:
-    text = _THINK_BLOCK_RE.sub('', text)      # closed <think>...</think>
-    return text.strip()
-
 
 def _render_success_trajectory(conv: List[Dict[str, Any]]) -> str:
     """Render the round-1 winning trajectory as an ordered TOOL-CALL PLAN for
@@ -183,28 +150,6 @@ def _render_success_trajectory(conv: List[Dict[str, Any]]) -> str:
                     f"({json.dumps(c['args'], ensure_ascii=False)})")
     return "\n".join(lines)
 
-def _find_advice_idx(messages: List[Dict[str, Any]]) -> Optional[int]:
-    for i, m in enumerate(messages):
-        if m.get("role") == "user" and ADVICE_MARKER in str(m.get("content", "")):
-            return i
-    return None
-
-def drop_tool_before_user(messages):
-      """删除紧邻在 user 消息之前的 tool 消息。
-
-      遍历 messages,每当遇到 role=='user' 的消息,就把它前方连续的
-      tool / tool_response 消息全部弹出,直到 user 前不再是 tool。
-      返回新列表,不修改原列表;末尾 tool(后面没有 user 跟随)不删。
-      """
-      TOOL_ROLES = {'tool'}
-      result = []
-      for m in messages:
-          if m.get('role') == 'user':
-              while result and result[-1].get('role') in TOOL_ROLES:
-                  result.pop()
-          result.append(m)
-      return result
-
 def _task_prefix(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Return a CLEAN on-policy starting context: the system prompt (if any)
     plus the first user turn (the task). No tool history, no prior answer.
@@ -225,13 +170,121 @@ def _task_prefix(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _last_advice(record: Dict[str, Any]) -> Optional[str]:
-    advice = None
-    for rd in record.get("rounds_detail") or []:
-        a = rd.get("teacher_advice")
-        if a:
-            advice = a
-    return advice
+def _safe_score(value: Any) -> Optional[float]:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    return score if math.isfinite(score) else None
+
+
+def _checker_errors(detail: Dict[str, Any]) -> int:
+    result = detail.get("verify_result")
+    if not isinstance(result, dict):
+        return 0
+    try:
+        return int(result.get("checker_errors") or 0)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _invalid_verification(detail: Dict[str, Any]) -> bool:
+    return bool(detail.get("verify_error")) or _checker_errors(detail) != 0
+
+
+def _is_complete(record: Dict[str, Any], detail: Dict[str, Any]) -> bool:
+    if record.get("data_source") == "envscaler_rl":
+        return detail.get("verify_reward_type") == "complete"
+    return detail.get("final_reward_type", detail.get("verify_reward_type")) == "complete"
+
+
+def _select_candidate(record: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], str]:
+    """Choose at most one target transition, independently validating scores."""
+    details = [d for d in (record.get("rounds_detail") or [])
+               if isinstance(d, dict)]
+    details.sort(key=lambda d: d.get("round", 0))
+    if not details:
+        return None, "no_rounds"
+
+    complete_idx = next(
+        (idx for idx, detail in enumerate(details)
+         if _is_complete(record, detail)),
+        None,
+    )
+    if complete_idx is not None:
+        target = details[complete_idx]
+        if _invalid_verification(target):
+            return None, "target_verify_error"
+        if complete_idx == 0:
+            return {
+                "sample_type": "complete_first_try",
+                "target": target,
+                "target_idx": complete_idx,
+                "source": None,
+                "baseline_score": _safe_score(details[0].get("verify_reward")),
+                "source_score": None,
+                "target_score": _safe_score(target.get("verify_reward")),
+            }, "kept"
+        source = details[complete_idx - 1]
+        if _invalid_verification(source):
+            return None, "source_verify_error"
+        if not source.get("teacher_advice"):
+            return None, "missing_advice"
+        return {
+            "sample_type": "complete_after_refine",
+            "target": target,
+            "target_idx": complete_idx,
+            "source": source,
+            "baseline_score": _safe_score(details[0].get("verify_reward")),
+            "source_score": _safe_score(source.get("verify_reward")),
+            "target_score": _safe_score(target.get("verify_reward")),
+        }, "kept"
+
+    baseline = details[0]
+    baseline_score = _safe_score(baseline.get("verify_reward"))
+    if baseline_score is None:
+        return None, "missing_baseline_score"
+    if _invalid_verification(baseline):
+        return None, "baseline_verify_error"
+
+    improved = []
+    for idx, detail in enumerate(details[1:], start=1):
+        score = _safe_score(detail.get("verify_reward"))
+        if (score is not None and score > baseline_score + 1e-9
+                and not _invalid_verification(detail)):
+            improved.append((score, idx, detail))
+    if not improved:
+        return None, "no_score_improvement"
+
+    best_score = max(score for score, _, _ in improved)
+    _, target_idx, target = next(
+        item for item in improved if abs(item[0] - best_score) <= 1e-12)
+    source = details[target_idx - 1]
+    if _invalid_verification(source):
+        return None, "source_verify_error"
+    if not source.get("teacher_advice"):
+        return None, "missing_advice"
+    return {
+        "sample_type": "improved_partial",
+        "target": target,
+        "target_idx": target_idx,
+        "source": source,
+        "baseline_score": baseline_score,
+        "source_score": _safe_score(source.get("verify_reward")),
+        "target_score": best_score,
+    }, "kept"
+
+
+def _round_messages(record: Dict[str, Any], detail: Dict[str, Any]) -> List[Dict[str, Any]]:
+    conv = record.get("student_conversation") or []
+    bounds = detail.get("message_range") or []
+    if (not isinstance(bounds, list) or len(bounds) != 2
+            or not all(isinstance(value, int) for value in bounds)):
+        return []
+    start, end = bounds
+    if start < 0 or end < start or end > len(conv):
+        return []
+    return copy.deepcopy(conv[start:end])
 
 
 def _lenient_json(s: Any) -> Any:
@@ -361,17 +414,9 @@ def convert(refine_jsonl: str, output_jsonl: str,
             awm_base_url: str = "http://localhost:8899",
             with_tools: bool = True) -> None:
     n_in = 0
-    n_hard = 0    # hard-success: round-1 fail + advice + eventual success
-    n_first = 0   # first-attempt success: solved round 1, no advice
-    rows: List[Dict[str, Any]] = []
+    drop_reasons: Counter = Counter()
+    rows_by_task: Dict[tuple, Dict[str, Any]] = {}
 
-    # Pass 1: read refine records, build swift rows. Two success cases are
-    # kept, symmetric in shape:
-    #   * hard-success   - round-1 failed (advice injected) and the episode
-    #                      ultimately succeeded; the real advice is the
-    #                      teacher's privileged info.
-    #   * first-attempt  - solved on round 1 (no advice); a fixed positive
-    #                      feedback stands in as the privileged info.
     with open(refine_jsonl, "r", encoding="utf-8") as fin:
         for line in fin:
             line = line.strip()
@@ -381,67 +426,108 @@ def convert(refine_jsonl: str, output_jsonl: str,
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                drop_reasons["invalid_json"] += 1
+                continue
+            candidate, reason = _select_candidate(rec)
+            if candidate is None:
+                drop_reasons[reason] += 1
                 continue
 
-            if not rec.get("success"):
-                continue
-
+            target = candidate["target"]
+            source = candidate["source"]
             conv = rec.get("student_conversation") or []
-            advice_idx = _find_advice_idx(conv)
-
-            if advice_idx is not None:
-                # Hard-success: cut at the advice turn, append the env-reset
-                # note; the teacher's privileged info is the real advice.
-                advice = _last_advice(rec)
-                if not advice:
+            if candidate["sample_type"] == "complete_first_try":
+                winning_round = _round_messages(rec, target)
+                if not winning_round:
+                    drop_reasons["invalid_target_range"] += 1
                     continue
-                prefix = _to_swift_agent_messages(
-                    copy.deepcopy(conv[:advice_idx]))
-                # prefix.append({"role": "assistant", "content": strip_think(conv[advice_idx-1].get("content", ""))})
-                prefix.append({"role": "user", "content": ENV_RESET_NOTE})
-                teacher_prompt = (
-                    _ADVICE_USER_BLOCK.format(advice=advice.strip())
-                    + "\n\n" + ENV_RESET_NOTE
-                )
-                n_hard += 1
-            else:
-                # First-attempt success: no advice was injected. Start the
-                # on-policy rollout from a CLEAN [system, task] context and let
-                # the student re-solve from scratch (exactly as it did in round
-
                 prefix = _task_prefix(copy.deepcopy(conv))
                 task_text = prefix[-1]["content"] if prefix else ""
-                trajectory = _render_success_trajectory(conv)
-                if trajectory.strip():
+                trajectory = _render_success_trajectory(winning_round)
+                if rec.get("data_source") == "deepcoder_taco":
+                    solution = str(target.get("student_final_answer") or "").strip()
+                    if not solution:
+                        drop_reasons["missing_reference_solution"] += 1
+                        continue
+                    teacher_prompt = (
+                        _CODE_REFERENCE_BLOCK.format(solution=solution)
+                        + "\n\n[User Question]" + task_text
+                    )
+                elif trajectory.strip():
                     teacher_prompt = (
                         _TRAJECTORY_HINT_BLOCK.format(trajectory=trajectory)
-                        + "\n\n" + "[User Question]"+task_text
+                        + "\n\n[User Question]" + task_text
                     )
                 else:
-                    # Degenerate trajectory (no tool calls captured): fall back
-                    # to the generic positive nudge so the row is still usable.
                     teacher_prompt = (
                         _ADVICE_USER_BLOCK.format(advice=POSITIVE_FEEDBACK)
                         + "\n\n[User Question]" + task_text
                     )
-                n_first += 1
+            else:
+                source_round = _round_messages(rec, source)
+                if not source_round:
+                    drop_reasons["invalid_source_range"] += 1
+                    continue
+                prefix = _to_swift_agent_messages(
+                    _task_prefix(copy.deepcopy(conv)) + source_round)
+                prefix.append({"role": "user", "content": ENV_RESET_NOTE})
+                teacher_prompt = (
+                    _ADVICE_USER_BLOCK.format(
+                        advice=str(source["teacher_advice"]).strip())
+                    + "\n\n" + ENV_RESET_NOTE
+                )
 
-            rows.append({
+            baseline_score = candidate["baseline_score"]
+            source_score = candidate["source_score"]
+            target_score = candidate["target_score"]
+            row = {
                 "messages": prefix,
                 "teacher_prompt": teacher_prompt,
+                "data_source": rec.get("data_source", "awm"),
                 "scenario": rec.get("scenario"),
                 "task_idx": rec.get("task_idx"),
-                # Consumed by awm_scheduler (req.data_dict['env_config']) to
-                # reset the AWM env for on-policy rollout during training.
+                "task_id": rec.get("task_id"),
                 "env_config": {
                     "scenario": rec.get("scenario"),
                     "task_idx": rec.get("task_idx"),
                     "awm_base_url": awm_base_url,
                 },
-                # Positive reward signal for GRPO/OPD-RL: the privileged
-                # trajectory is a known success.
-                "verify_reward_type": "complete",
-            })
+                "sample_type": candidate["sample_type"],
+                "source_round": source.get("round") if source else None,
+                "target_round": target.get("round"),
+                "baseline_score": baseline_score,
+                "source_score": source_score,
+                "target_score": target_score,
+                "score_delta": (
+                    target_score - baseline_score
+                    if target_score is not None and baseline_score is not None
+                    else None
+                ),
+                "verify_reward": target_score,
+                "verify_reward_type": target.get("verify_reward_type"),
+            }
+            key = (
+                row["data_source"], row["scenario"],
+                row["task_id"] if row["task_id"] is not None else row["task_idx"],
+            )
+            previous = rows_by_task.get(key)
+            if previous is None:
+                rows_by_task[key] = row
+            else:
+                drop_reasons["duplicate_task"] += 1
+                priority = {"improved_partial": 1, "complete_after_refine": 2,
+                            "complete_first_try": 3}
+                row_score = (row["target_score"]
+                             if row["target_score"] is not None else -math.inf)
+                previous_score = (
+                    previous["target_score"]
+                    if previous["target_score"] is not None else -math.inf)
+                if (priority[row["sample_type"]], row_score) > (
+                        priority[previous["sample_type"]],
+                        previous_score):
+                    rows_by_task[key] = row
+
+    rows = list(rows_by_task.values())
 
     # Pass 2: fetch each scenario's tool schemas once (swift `tools` field), so
     # the model sees the tool definitions during training.
@@ -453,26 +539,25 @@ def convert(refine_jsonl: str, output_jsonl: str,
             _fetch_tools_by_scenario(scenarios, awm_base_url))
 
     # Pass 3: write out, attaching the tools string per row.
-    n_kept = 0
     with open(output_jsonl, "w", encoding="utf-8") as fout:
         for row in rows:
             tools = tools_by_scenario.get(row.get("scenario"), "")
             if tools:
-                # swift expects `tools` as a JSON *string* of the tool list.
                 row = {"tools": tools, **row}
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
-            n_kept += 1
 
-    print(f"Read {n_in} refine records, kept {n_kept} cases "
-          f"(hard-success={n_hard}, first-attempt={n_first}) -> {output_jsonl}")
+    kept = Counter(row["sample_type"] for row in rows)
+    print(f"Read {n_in} refine records, kept {len(rows)} cases "
+          f"{dict(kept)}, dropped {dict(drop_reasons)} -> {output_jsonl}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--refine-jsonl", required=True)
     parser.add_argument("--output-jsonl", required=True)
-    parser.add_argument("--awm-base-url", default="http://localhost:8899",
-                        help="AWM env server used to fetch per-scenario tool schemas.")
+    parser.add_argument("--env-base-url", "--awm-base-url",
+                        dest="awm_base_url", default="http://localhost:8899",
+                        help="Environment server used to fetch tool schemas.")
     parser.add_argument("--no-tools", action="store_true",
                         help="Skip fetching/attaching the `tools` field.")
     args = parser.parse_args()

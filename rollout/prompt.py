@@ -7,7 +7,11 @@ Prompts and input builders for rollout and critic.
   then emits multiple `# Experience: <one-line lesson>` rows.
 - build_critic_batch_input(): renders one scenario's N rollout records
   (task, outcome, trajectory) into the initial user message for the critic.
+- JUDGE_SYSTEM_PROMPT / build_judge_input(): LLM-as-judge verdict for one
+  refine round; taxonomy aligned with the AWM server-side judge.
 """
+
+import json
 
 from agent_world_model_env.server.prompts import DEFAULT_SYSTEM_PROMPT as ROLLOUT_SYSTEM_PROMPT
 
@@ -77,6 +81,65 @@ Based on everything you have already done and observed, write your FINAL ANSWER 
 now as plain natural-language text only **whether the task is completed or not**. If the task asked you to perform \
 actions, state concisely what you completed (and, if you could not finish, say \
 so plainly)."""
+
+
+ENVSCALER_STUDENT_NATIVE_SYSTEM_PROMPT = """\
+You are an agent operating in a stateful tool environment. Use the provided \
+tools to complete the user's task. Inspect the environment before making \
+changes, obey all stated constraints, and do not invent tool results.
+
+How to work:
+- You may call up to 3 tools in one assistant turn. Read their responses before deciding the next step.
+- You have a limited number of tool-calling turns, so prioritize the operations needed by the task.
+- `verify` and `done` are managed by the harness — never call them yourself.
+- When the task is complete, stop calling tools and give the user a concise final answer.
+Current date: {current_date}."""
+
+
+ENVSCALER_STUDENT_NATIVE_FINAL_SYSTEM_PROMPT = """\
+You are an agent operating in a stateful tool environment.
+
+This is your FINAL turn: your tool-calling budget is exhausted, so you CANNOT \
+call any more tools. Do NOT emit any tool call, function call, JSON action, or \
+tool-call markup.
+
+Based on the task and the tool results already observed, state concisely what \
+you completed. If the task is not fully complete, say so plainly."""
+
+
+CODE_JUDGE_STUDENT_SYSTEM_PROMPT = """\
+You are a competitive programmer. Solve the user's programming problem in \
+Python. Reason carefully about the input format, constraints, edge cases, and \
+algorithmic complexity.
+
+Reason efficiently and stop analyzing once you have a sound algorithm and \
+implementation plan. Keep internal reasoning under roughly 3,000 tokens and \
+reserve at least 4,000 tokens for the final code. Never spend the full response \
+budget exploring alternatives. Before the budget runs low, end your reasoning \
+and submit the best complete runnable solution you have, even if you are not \
+fully certain. Reasoning without a code submission is always invalid.
+
+Your final response MUST contain the complete submission in the LAST fenced \
+Python block:
+```python
+# complete solution
+```
+Only that last Python block is executed against hidden tests. Do not place \
+tests, explanations, or additional code blocks after it."""
+
+
+CODE_JUDGE_STUDENT_FINAL_SYSTEM_PROMPT = """\
+This is your final answer for a competitive-programming problem. Return a \
+complete Python solution in the LAST fenced Python block. Only that block is \
+executed against hidden tests. Check input parsing, output formatting, edge \
+cases, and complexity before answering.
+
+Think efficiently: stop once you have a sound solution, keep internal reasoning \
+under roughly 3,000 tokens, and reserve at least 4,000 tokens for the code. \
+Never use the entire response budget for reasoning. Before the budget runs low, \
+end your reasoning and output the best complete runnable solution you have, even \
+if uncertain. A response with reasoning but no code is invalid. Do not put \
+anything after the final code block."""
 
 
 CRITIC_SYSTEM_PROMPT = """\
@@ -263,9 +326,134 @@ Probing phase:
 """
 
 
+CODE_JUDGE_TEACHER_ADVICE_SYSTEM_PROMPT = """\
+You are an expert competitive-programming coach. A student solution was run \
+against hidden tests. You can see the problem, the attempted answer, and only \
+aggregate verifier feedback; hidden inputs and expected outputs are unavailable.
+
+Diagnose the most likely algorithm, implementation, parsing, formatting, or \
+complexity issue. Produce a concise, transferable correction that helps the \
+student make the next attempt substantially better. Do not write the complete \
+solution and do not invent hidden-test details.
+
+Output exactly one advice block beginning with `# Advice:`."""
+
+
+CODE_JUDGE_TEACHER_FINALIZE_SYSTEM_PROMPT = """\
+You are an expert competitive-programming coach. Based on the problem, attempted \
+solution, and aggregate hidden-test score, emit a concise actionable diagnosis.
+
+Start with `# Advice:`. Do not provide the complete solution, do not invent \
+hidden tests, and do not claim a specific bug unless the visible code supports it."""
+
+
+# LLM-as-judge for the refine pipeline. Taxonomy / priority order / JSON
+# output contract are aligned with the AWM server-side judge
+# (OpenEnv/envs/agent_world_model_env/server/verifier.py::run_llm_judge, which
+# mirrors agent-world-model-rl-rewards/task_reward.py) so client- and
+# server-judged scores stay comparable. The evidence differs: here the judge
+# sees the deterministic CODE verifier's result instead of a SQL DB diff.
+JUDGE_SYSTEM_PROMPT = """\
+You are an impartial evaluator of automated agent task results with access \
+to database verification. Based on the provided JSON trajectory AND the \
+Python verification results from querying the database, decide the task \
+outcome. This trajectory is generated by an MCP agent on a simulated \
+simplified environment. The environment provides a set of MCP tools to help \
+the agent complete the task.
+
+Input:
+    task_json: dict containing the user task and the agent's execution trace \
+for one attempt round.
+    verification_json: dict containing the execution results of the \
+deterministic code verifier that inspected the database state.
+
+Output:
+    You only output UTF-8 encoded string, avoid any emoji or special \
+characters. You only output English text.
+
+Classification categories:
+    - complete: all required steps and closure actions were successfully \
+executed, AND the database state confirms the task was completed
+    - incomplete: partial progress or the database state shows the task is \
+not fully completed
+    - server_error: the agent is blocked by MCP server/environment error, \
+e.g., 5xx errors such as "Internal Server Error". Or the MCP server cannot \
+process the valid tool call and return valid results. This can block the \
+agent from completing the task.
+    - agent_error: the agent made mistakes, invalid parameters, or missing \
+required data without recovery, failed to complete the user's instruction.
+
+Priority order for classification:
+    1) complete (trajectory shows success AND database confirms it)
+    2) server_error (due to the MCP server/environment error)
+    3) agent_error (agent-side issue, e.g., invalid tool_call arguments, \
+hallucination, agent mistakes)
+    4) incomplete (everything else unfinished or database state doesn't \
+match expected outcome)
+
+Key considerations:
+- The verification_json contains the execution results of the verification \
+code run against the database. You can use them to help you judge the task \
+completion.
+- The verification results may be empty or error, or even the verification \
+code itself may be inaccurate or too strict. You should not fully rely on \
+the verification results. You need to comprehensively consider the \
+trajectory information to help you judge the task completion.
+- The final_answer is the agent's own claim of what it did; trust the \
+trajectory and the database checks over it.
+
+Output format (must be valid JSON, no markdown fences, no additional commentary):
+    {
+      "reasoning": "<concise explanation considering both trajectory and verification code execution results, the confidence score and considerations for each classification category>",
+      "confidence_score": [0-100, 0-100, 0-100, 0-100] for complete, incomplete, server_error, agent_error respectively,
+      "classification": "<one_of_[complete, incomplete, server_error, agent_error]>",
+      "evidence": {
+        "error_signals": ["<important error messages from the trajectory>"],
+        "last_actions": ["<summaries of last few actions>"],
+        "database_verification": "<summary of what the database state shows based on the code verifier execution results>"
+      }
+    }"""
+
+
+def build_judge_input(task: str, round_messages: list[dict],
+                      final_answer: str,
+                      code_verify: dict) -> str:
+    """Render the judge user message for ONE refine round.
+
+    `round_messages` is the student conversation slice for the current round
+    (assistant turns incl. tool_calls + tool responses). `code_verify` carries
+    the deterministic verifier's reward_type and raw verify_result - evidence,
+    not the verdict: the judge may override it in either direction.
+    """
+    traj_text = _render_student_conversation(round_messages,
+                                             max_chars_per_msg=2000)
+    try:
+        verify_json = json.dumps(code_verify.get("verify_result"),
+                                 ensure_ascii=False, default=str)
+    except Exception:
+        verify_json = str(code_verify.get("verify_result"))
+    parts = [
+        "task_json:",
+        json.dumps({
+            "user_task": task,
+            "final_answer": final_answer,
+            "trajectory": traj_text,
+        }, ensure_ascii=False, indent=2),
+        "",
+        "verification_json:",
+        json.dumps({
+            "code_reward_type": code_verify.get("reward_type"),
+            "code_execution_result": verify_json,
+        }, ensure_ascii=False, indent=2),
+    ]
+    return "\n".join(parts)
+
+
 def build_teacher_advice_input(task: str, student_conversation: list[dict],
                                 verify_reward_type: str,
                                 verify_error: str | None,
+                                verify_summary: str | None = None,
+                                allow_tool_probes: bool = True,
                                 ) -> str:
     """Render the initial user message for the teacher-advisor turn.
 
@@ -285,12 +473,21 @@ def build_teacher_advice_input(task: str, student_conversation: list[dict],
     ]
     if verify_error:
         parts.append(f"error: {verify_error}")
-    parts += [
-        "",
-        "You may now issue up to 3 read-only tool probes (call tools directly "
-        "by name) to diagnose the situation. When ready, emit ONLY the final "
-        "`# Advice: ...` line.",
-    ]
+    if verify_summary:
+        parts.append(f"verification_summary: {verify_summary}")
+    parts.append("")
+    if allow_tool_probes:
+        parts.append(
+            "You may now issue up to 3 read-only tool probes (call tools "
+            "directly by name) to diagnose the situation. When ready, emit "
+            "ONLY the final `# Advice: ...` line."
+        )
+    else:
+        parts.append(
+            "No diagnostic tools are available. Diagnose the visible attempt "
+            "and aggregate verifier feedback, then emit ONLY the final "
+            "`# Advice: ...` line."
+        )
     return "\n".join(parts)
 
 

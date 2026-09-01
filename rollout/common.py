@@ -16,6 +16,7 @@ Shared plumbing for rollout and critic:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -170,7 +171,8 @@ class RetryLLM:
     async def chat_message(self, messages: list[dict], temperature: float = 1.0,
                            max_tokens: int = 2048,
                            tools: list | None = None,
-                           tool_choice=None):
+                           tool_choice=None,
+                           extra_body: dict | None = None):
         """Return the full assistant message object so callers can read both
         `.content` and `.tool_calls` (some models — e.g. seed-2.1-pro — emit
         native tool_calls with content=None even when the system prompt asks
@@ -180,7 +182,14 @@ class RetryLLM:
         is provided it is passed straight through to the OpenAI-compatible
         endpoint so the model emits `message.tool_calls`. Both default to None
         (omitted from the request), so existing XML-route callers are
-        completely unaffected."""
+        completely unaffected.
+
+        `extra_body` carries non-standard request fields the OpenAI SDK does
+        not model, forwarded via the SDK's extra_body mechanism - e.g.
+        {"thinking": {"type": "disabled"}} to switch off an Ark seed/doubao
+        reasoning model, or {"chat_template_kwargs": {"enable_thinking":
+        False}} for vLLM-served Qwen. Per-call on purpose: one client can
+        serve both thinking (teacher advice) and non-thinking (judge) turns."""
         est = estimate_tokens(messages) + max_tokens
 
         def _create():
@@ -194,6 +203,8 @@ class RetryLLM:
                 kwargs["tools"] = tools
                 if tool_choice is not None:
                     kwargs["tool_choice"] = tool_choice
+            if extra_body is not None:
+                kwargs["extra_body"] = extra_body
             return self._client.chat.completions.create(**kwargs)
 
         return await self._call_with_retry(
@@ -554,6 +565,23 @@ async def llm_turn(llm: "RetryLLM", messages: list[dict], *,
 # rollout.py / critic.py keep working exactly as before.
 # ---------------------------------------------------------------------------
 _META_TOOL_NAMES = {"verify", "done", "list_tools"}
+_ANY_JSON_TYPES = ["string", "number", "boolean", "object", "array", "null"]
+
+
+def _normalize_tool_parameters(parameters: dict) -> dict:
+    """Repair unconstrained EnvScaler properties for strict tool consumers.
+
+    An empty property schema is valid JSON Schema, but verl's OpenAI schema
+    model requires an explicit ``type``. A union of every JSON value type keeps
+    the original unconstrained semantics.
+    """
+    normalized = copy.deepcopy(parameters)
+    properties = normalized.get("properties", {})
+    if isinstance(properties, dict):
+        for schema in properties.values():
+            if isinstance(schema, dict) and "type" not in schema:
+                schema["type"] = list(_ANY_JSON_TYPES)
+    return normalized
 
 
 def tools_to_openai_schema(tools) -> list[dict]:
@@ -570,6 +598,8 @@ def tools_to_openai_schema(tools) -> list[dict]:
         params = t.input_schema if isinstance(t.input_schema, dict) else {}
         if not params:
             params = {"type": "object", "properties": {}}
+        else:
+            params = _normalize_tool_parameters(params)
         schemas.append({
             "type": "function",
             "function": {
@@ -683,7 +713,8 @@ async def llm_turn_native(llm: "RetryLLM", messages: list[dict], *,
                         temperature: float,
                         max_tokens: int,
                         tools: list[dict] = None,tool_choice: str = "auto",
-                        system_override: str | None = None) -> LLMTurnNative:
+                        system_override: str | None = None,
+                        extra_body: dict | None = None) -> LLMTurnNative:
     """Native-function-calling counterpart of `llm_turn`. Calls the LLM with a
     `tools` schema, appends a proper native assistant message (content +
     `tool_calls` with ids, plus a persisted `reasoning` field) to `messages`,
@@ -712,7 +743,8 @@ async def llm_turn_native(llm: "RetryLLM", messages: list[dict], *,
         wire_messages = _apply_system_override(wire_messages, system_override)
     msg = await llm.chat_message(wire_messages, temperature=temperature,
                                  max_tokens=max_tokens,
-                                 tools=tools, tool_choice=tool_choice)
+                                 tools=tools, tool_choice=tool_choice,
+                                 extra_body=extra_body)
     raw_content = msg.content or ""
     reasoning = _extract_reasoning(msg)
     if reasoning is None:

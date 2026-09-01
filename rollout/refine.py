@@ -1,54 +1,33 @@
-"""
-Iterative refinement pipeline for Self-OPD data collection.
+"""Dataset filtering and iterative experience extraction.
 
-Per (scenario, task_idx):
+Supported profiles are AWM tool tasks, EnvScaler checklist tasks, and
+DeepCoder/TACO programming tasks. Every round starts from a fresh environment,
+runs the student, verifies the result, and optionally asks a teacher for one
+actionable ``# Advice:`` experience before retrying.
 
-  1. Fresh AWMEnv session, reset(scenario, task_idx). This is the student's
-     env. The env is RESET at the start of every round, so each round begins
-     from a pristine DB state — a round that corrupts the DB cannot poison
-     later rounds.
-
-  2. For k = 1..K:
-       a. If k > 1, the student env is reset first (fresh DB; conversation
-          history — including teacher advice — carries over). Student
-          (Qwen3.5-4B) continues the conversation, calls tools on the
-          student env, produces `traj_k`. Each round the LLM has up
-          to `student_max_iterations` LLM turns to converge.
-       b. `verify` is invoked (code mode) — it's read-only so calling it
-          multiple times is safe.
-       c. If reward_type == "complete", success; break.
-       d. If k == K, no more advice will be produced; break.
-       e. Teacher (a stronger LLM) is invoked to produce ONE line of
-          `# Advice: <one-liner>`. The teacher runs against its OWN
-          separate AWMEnv session that has been synchronised to the
-          student's current DB state by REPLAYING the student's successful
-          tool_calls from the CURRENT round (earlier rounds' mutations were
-          discarded by the per-round reset). Teacher can call_tool up to 3
-          times to probe.
-          Only the `# Advice:` line is extracted; the teacher's private
-          conversation is discarded.
-       f. The advice is appended to the student conversation as a single
-          user message:   {"role":"user","content":"[Expert advice]\\n# Advice: ..."}
-
-  3. Emit a JSONL record capturing:
-       * student's full conversation (WITH the advice user turns — a
-         downstream trainer can mask them off).
-       * per-round detail: which turn range belongs to that round, the
-         verify result at that point, and (for rounds 1..k-1) the teacher
-         advice.
-       * summary fields: rounds, success, success_at_round, elapsed.
+AWM keeps its LLM judge as the authoritative verdict, with judge thinking
+disabled. EnvScaler and CodeJudge use their deterministic dense verifier scores.
+Records retain the complete conversation, per-round score/evidence/advice, and a
+single candidate classification: first-try complete, complete after refinement,
+improved partial, or no improvement.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import copy
 import json
+import math
 import os
 import re
 import time
-from dataclasses import dataclass, field, asdict
+import urllib.request
+from collections import Counter
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 from openenv.core.env_server.mcp_types import CallToolAction, ListToolsAction
 
@@ -59,19 +38,34 @@ from rollout.common import (
     RateLimiter,
     RetryLLM,
     execute_native_tool_call,
-    format_tools,
     llm_turn_native,
     loads_lenient,
     run_jobs,
     tools_to_openai_schema,
 )
 from rollout.prompt import (
+    CODE_JUDGE_STUDENT_FINAL_SYSTEM_PROMPT,
+    CODE_JUDGE_STUDENT_SYSTEM_PROMPT,
+    CODE_JUDGE_TEACHER_ADVICE_SYSTEM_PROMPT,
+    CODE_JUDGE_TEACHER_FINALIZE_SYSTEM_PROMPT,
+    ENVSCALER_STUDENT_NATIVE_FINAL_SYSTEM_PROMPT,
+    ENVSCALER_STUDENT_NATIVE_SYSTEM_PROMPT,
+    JUDGE_SYSTEM_PROMPT,
     STUDENT_NATIVE_SYSTEM_PROMPT,
     STUDENT_NATIVE_FINAL_SYSTEM_PROMPT,
     TEACHER_ADVICE_SYSTEM_PROMPT,
     TEACHER_FINALIZE_SYSTEM_PROMPT,
+    build_judge_input,
     build_teacher_advice_input,
 )
+
+# 统一加载仓库根目录的 .env（student/teacher/judge 的 LLM 端点与 API key）。
+# 与 benchmark/eval/run_eval.py 相同的约定：不覆盖 shell 里已有的变量，
+# 因此临时 export 依然优先生效。文件已 gitignore，不装载入仓库。
+# 可配置键：AWM_BASE_URL / ENDPOINT_URL / AWM_EXAMPLE_AGENT_MODEL /
+# TEACHER_BASE_URL / TEACHER_MODEL / ARK_API_KEY /
+# JUDGE_BASE_URL / JUDGE_API_KEY / JUDGE_MODEL。
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 # Relaxed: matches "# Advice:" / "Advice:" / "advice:" with optional leading
@@ -82,19 +76,176 @@ ADVICE_LINE_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 
+_HARNESS_TOOLS = frozenset({"verify", "done"})
+_STUDENT_FORBIDDEN_TOOL_ERROR = (
+    "Error: 'verify' and 'done' are managed by the harness; "
+    "To finish, STOP calling tools and reply with your final answer as plain text."
+)
+_TEACHER_FORBIDDEN_TOOL_ERROR = (
+    "Error: teacher may not call verify/done. To finish, STOP calling tools "
+    "and reply with your final answer as plain text."
+)
+_TEACHER_FINALIZE_REQUEST = (
+    "Probing phase is over. Do NOT call any tools. Emit your final diagnosis "
+    "now, starting with `# Advice:` on its own line."
+)
+_EXPERT_ADVICE_TEMPLATE = (
+    "[Expert advice]\n# Advice: {advice}\n\n"
+    "Notice: Your first tried failed and the environment has been reset to its "
+    "initial state. please try again."
+)
 
-# ---------------------------------------------------------------------------
-# Student half-turn: continue an existing `messages` list on an existing env.
-# Returns (updated_messages, per-turn trace list, final_answer_str,
-#          made_tool_call, executed_tool_calls, error_or_None).
-# The env may have been mutated by earlier tool calls in THIS round; we do
-# NOT reset here — resetting between rounds is the caller's job.
-# ---------------------------------------------------------------------------
+# Ark request body used only by the authoritative AWM judge. Teacher and
+# student calls keep their existing thinking behavior.
+_JUDGE_THINKING_OFF_BODY = {"thinking": {"type": "disabled"}}
+
+
+@dataclass(frozen=True)
+class BackendProfile:
+    name: str
+    data_source: str
+    default_base_url: str
+    default_tasks_per_scenario: int | None
+    default_student_iterations: int
+    default_student_max_tokens: int
+    default_teacher_tool_calls: int
+    default_llm_judge: bool
+    judge_authoritative: bool
+    judge_extra_body: dict | None
+    include_verify_summary: bool
+    student_system_prompt: str
+    student_final_system_prompt: str
+    teacher_system_prompt: str
+    teacher_finalize_system_prompt: str
+    output_stem: str
+
+
+def _backend_profile(name: str) -> BackendProfile:
+    name = {
+        "codejudge": "deepcoder-taco",
+        "deepcoder_taco": "deepcoder-taco",
+    }.get(name, name)
+    if name == "envscaler":
+        return BackendProfile(
+            name=name,
+            data_source="envscaler_rl",
+            default_base_url="http://127.0.0.1:8900",
+            default_tasks_per_scenario=None,
+            default_student_iterations=16,
+            default_student_max_tokens=2048,
+            default_teacher_tool_calls=3,
+            default_llm_judge=False,
+            judge_authoritative=False,
+            judge_extra_body=None,
+            include_verify_summary=True,
+            student_system_prompt=ENVSCALER_STUDENT_NATIVE_SYSTEM_PROMPT.format(
+                current_date=date.today().isoformat()),
+            student_final_system_prompt=ENVSCALER_STUDENT_NATIVE_FINAL_SYSTEM_PROMPT,
+            teacher_system_prompt=TEACHER_ADVICE_SYSTEM_PROMPT,
+            teacher_finalize_system_prompt=TEACHER_FINALIZE_SYSTEM_PROMPT,
+            output_stem="envscaler_epoch1",
+        )
+    if name == "deepcoder-taco":
+        return BackendProfile(
+            name=name,
+            data_source="deepcoder_taco",
+            default_base_url="http://127.0.0.1:8901",
+            default_tasks_per_scenario=None,
+            default_student_iterations=1,
+            default_student_max_tokens=8192,
+            default_teacher_tool_calls=0,
+            default_llm_judge=False,
+            judge_authoritative=False,
+            judge_extra_body=None,
+            include_verify_summary=True,
+            student_system_prompt=CODE_JUDGE_STUDENT_SYSTEM_PROMPT,
+            student_final_system_prompt=CODE_JUDGE_STUDENT_FINAL_SYSTEM_PROMPT,
+            teacher_system_prompt=CODE_JUDGE_TEACHER_ADVICE_SYSTEM_PROMPT,
+            teacher_finalize_system_prompt=CODE_JUDGE_TEACHER_FINALIZE_SYSTEM_PROMPT,
+            output_stem="deepcoder_taco_epoch1",
+        )
+    if name == "awm":
+        return BackendProfile(
+            name=name,
+            data_source="awm",
+            default_base_url="http://localhost:8899",
+            default_tasks_per_scenario=10,
+            default_student_iterations=4,
+            default_student_max_tokens=2048,
+            default_teacher_tool_calls=3,
+            default_llm_judge=True,
+            judge_authoritative=True,
+            judge_extra_body=_JUDGE_THINKING_OFF_BODY,
+            include_verify_summary=False,
+            student_system_prompt=STUDENT_NATIVE_SYSTEM_PROMPT,
+            student_final_system_prompt=STUDENT_NATIVE_FINAL_SYSTEM_PROMPT,
+            teacher_system_prompt=TEACHER_ADVICE_SYSTEM_PROMPT,
+            teacher_finalize_system_prompt=TEACHER_FINALIZE_SYSTEM_PROMPT,
+            output_stem="refine_epoch1",
+        )
+    raise ValueError(f"unsupported dataset backend: {name!r}")
+
+
+def _parse_tool_call(tool_call: dict) -> tuple[str, str, dict]:
+    """Normalize one OpenAI-style native tool call."""
+    function = tool_call.get("function") or {}
+    raw_args = function.get("arguments", "{}")
+    args = loads_lenient(raw_args) if isinstance(raw_args, str) else raw_args
+    return (
+        tool_call.get("id", ""),
+        function.get("name", ""),
+        args if isinstance(args, dict) else {},
+    )
+
+
+async def _execute_tool(env, name: str, args: dict, *,
+                        forbidden_error: str, response_cap: int) -> str:
+    if name in _HARNESS_TOOLS:
+        response = forbidden_error
+    else:
+        try:
+            response = (await execute_native_tool_call(env, name, args)).text
+        except Exception as exc:
+            response = f"Error executing tool: {exc!r}"
+    return (response or "")[:response_cap]
+
+
+def _model_text(turn) -> str:
+    """Prefer content, falling back to reasoning when content is blank."""
+    content = turn.content or ""
+    if not content.strip() and turn.reasoning:
+        return turn.reasoning
+    return content
+
+
+def _json_object_from_text(text: str) -> dict | None:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            return None
+        try:
+            parsed = json.loads(match.group())
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def _close_quietly(env) -> None:
+    try:
+        await env.close()
+    except Exception:
+        pass
+
+
 async def _student_step(env, llm: RetryLLM, messages: list[dict],
                          tools_schema: list[dict],
                          max_iterations: int, max_tokens: int,
                          temperature: float,
-                         tool_response_cap: int = 4000) -> dict:
+                         tool_response_cap: int = 4000,
+                         final_system_prompt: str =
+                         STUDENT_NATIVE_FINAL_SYSTEM_PROMPT) -> dict:
     trace: list[dict] = []
     executed: list[dict] = []
     content = ""
@@ -105,69 +256,49 @@ async def _student_step(env, llm: RetryLLM, messages: list[dict],
     for step in range(1, max_iterations + 1):
         step_used = step
         is_last = step == max_iterations
-        tool_choice = "none" if is_last else "auto"
-        system_override = STUDENT_NATIVE_FINAL_SYSTEM_PROMPT if is_last else None
-        tools_schema = tools_schema if not is_last else None  # forbid tools on last turn
         try:
-            turn = await llm_turn_native(llm, messages, tools=tools_schema,
-                                         temperature=temperature,
-                                         max_tokens=max_tokens,
-                                         tool_choice=tool_choice,
-                                         system_override=system_override)
-        except Exception as e:
-            error = f"student LLM error at step {step}: {e!r}"[:500]
+            turn = await llm_turn_native(
+                llm,
+                messages,
+                tools=None if is_last else tools_schema,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tool_choice="none" if is_last else "auto",
+                system_override=(
+                    final_system_prompt if is_last else None
+                ),
+            )
+        except Exception as exc:
+            error = f"student LLM error at step {step}: {exc!r}"[:500]
             break
 
         content = turn.content
         trace.append({"step": step, "assistant": (content or "")[:2000]})
 
-        tool_calls = turn.tool_calls
-        if not tool_calls:
+        if not turn.tool_calls:
             break
 
         made_tool_call = True
-        # Every native tool_call MUST be answered by a paired `role:tool`
-        # message carrying the same tool_call_id, or the next request 400s
-        # with MissingParameter. Iterate all of them in order.
-        for tc in tool_calls[:3]:
-            tc_id = tc.get("id", "")
-            fn = tc.get("function") or {}
-            name = fn.get("name", "")
-            raw_args = fn.get("arguments", "{}")
-            args = loads_lenient(raw_args) if isinstance(raw_args, str) else raw_args
-            if not isinstance(args, dict):
-                args = {}
-
-            # Refuse verify/done from the student loop — those are pipeline-level.
-            if name in ("verify", "done"):
-                tool_response = (
-                    "Error: 'verify' and 'done' are managed by the harness; "
-                    "To finish, STOP calling tools and reply with your final answer as plain text."
-                )
-            else:
-                try:
-                    tool_response = (
-                        await execute_native_tool_call(env, name, args)).text
-                except Exception as e:
-                    tool_response = f"Error executing tool: {e!r}"
-            tool_response = (tool_response or "")[:tool_response_cap]
+        for tool_call in turn.tool_calls[:3]:
+            call_id, name, args = _parse_tool_call(tool_call)
+            tool_response = await _execute_tool(
+                env,
+                name,
+                args,
+                forbidden_error=_STUDENT_FORBIDDEN_TOOL_ERROR,
+                response_cap=tool_response_cap,
+            )
             trace.append({
                 "step": step,
                 "tool": name,
                 "arguments": args,
                 "response": tool_response[:800],
             })
-            # Track successfully executed scenario tool calls for later replay
-            # on the teacher's mirror env. Names are already real scenario tool
-            # names in native mode, so record them directly.
-            if name not in ("verify", "done") and not tool_response.startswith("Error"):
-                executed.append({
-                    "tool_name": name,
-                    "arguments": args,
-                })
+            if name not in _HARNESS_TOOLS and not tool_response.startswith("Error"):
+                executed.append({"tool_name": name, "arguments": args})
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc_id,
+                "tool_call_id": call_id,
                 "content": f"{tool_response}\n\nYou have {max_iterations-step-1} remaining opportunities for parallel tool calls. Once the count hits 0, you must respond to the user directly whether the task is completed or not.",
             })
 
@@ -193,14 +324,93 @@ async def _verify_only(env, final_answer: str) -> dict:
         "reward": verify.reward,
         "reward_type": verify.observation.reward_type,
         "verify_result": verify.observation.verify_result,
+        "error": getattr(verify.observation, "error", None),
     }
 
 
-# ---------------------------------------------------------------------------
-# Teacher half-turn: open a fresh AWMEnv session, replay the student's
-# executed tool_calls to synchronise DB state, then run a small tool-using
-# agent loop to produce ONE `# Advice:` line.
-# ---------------------------------------------------------------------------
+_JUDGE_CLASSIFICATIONS = ("complete", "incomplete", "server_error", "agent_error")
+
+def _judge_result(classification="judge_error") -> dict:
+    return {
+        "classification": classification,
+        "reasoning": None,
+        "confidence_score": None,
+        "error": None,
+    }
+
+
+async def _llm_judge_round(judge_llm: RetryLLM, task: str,
+                           round_messages: list[dict],
+                           final_answer: str,
+                           code_verify: dict,
+                           temperature: float, max_tokens: int,
+                           timeout: float,
+                           extra_body: dict | None = None) -> dict:
+    """LLM-as-judge verdict for ONE round. Never raises: failures come back
+    as {'classification': 'judge_error', 'error': ...} and the caller falls
+    back to the code verifier's verdict.
+
+    `round_messages` is passed BY VALUE into llm_turn_native - that helper
+    appends the assistant reply to the list it is given, so a throwaway list
+    keeps the judge's reply out of the student conversation.
+
+    `extra_body` carries endpoint-specific request fields. The AWM profile uses
+    it to disable judge thinking (see _JUDGE_THINKING_OFF_BODY)."""
+    result = _judge_result()
+    try:
+        user_text = build_judge_input(
+            task=task,
+            round_messages=round_messages,
+            final_answer=final_answer,
+            code_verify=code_verify,
+        )
+        # Fresh list on purpose (see docstring); tools stay disabled.
+        turn = await asyncio.wait_for(
+            llm_turn_native(
+                judge_llm,
+                [{"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                 {"role": "user", "content": user_text}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_body=extra_body,
+            ),
+            timeout=timeout,
+        )
+        raw = _model_text(turn).strip()
+        parsed = _json_object_from_text(raw)
+        if parsed is None:
+            result["error"] = f"failed to parse judge output (len={len(raw)})"
+            return result
+
+        classification = str(parsed.get("classification", "")).lower().strip()
+        if classification not in _JUDGE_CLASSIFICATIONS:
+            result["error"] = f"invalid classification {classification!r}"
+            return result
+        result["classification"] = classification
+        result["reasoning"] = str(parsed.get("reasoning") or "")[:1000] or None
+        result["confidence_score"] = parsed.get("confidence_score")
+    except asyncio.TimeoutError:
+        result["error"] = f"judge timed out after {timeout}s"
+    except Exception as exc:
+        result["error"] = f"judge failed: {exc!r}"[:500]
+    return result
+
+
+def _extract_advice(final_text: str, error: str | None) -> tuple[str | None, str | None]:
+    raw = final_text.strip()
+    clean = re.sub(r"<tool_call>.*?</tool_call>", "", raw,
+                   flags=re.DOTALL).strip()
+    match = ADVICE_LINE_RE.search(clean)
+    advice = match.group(1).strip() if match else (clean if len(clean) > 20 else None)
+    if advice is not None or error is not None:
+        return advice, error
+    if not raw:
+        return None, "finalize returned empty text"
+    if not clean:
+        return None, "finalize returned only <tool_call> blocks"
+    return None, f"finalize text unparseable (len={len(clean)})"
+
+
 async def _teacher_advise(awm_base_url: str, scenario: str, task_idx: int,
                           task: str, student_messages: list[dict],
                           past_tool_calls: list[dict],
@@ -211,7 +421,11 @@ async def _teacher_advise(awm_base_url: str, scenario: str, task_idx: int,
                           max_tool_calls: int = 3,
                           max_tokens: int = 8192,
                           temperature: float = 0.4,
-                          tool_response_cap: int = 4000) -> dict:
+                          tool_response_cap: int = 4000,
+                          verify_summary: str | None = None,
+                          teacher_system_prompt: str = TEACHER_ADVICE_SYSTEM_PROMPT,
+                          teacher_finalize_system_prompt: str =
+                          TEACHER_FINALIZE_SYSTEM_PROMPT) -> dict:
     """Return {'advice': str | None, 'rounds_used': int, 'tool_calls_made': int,
     'replay_ok': bool, 'error': str | None}. The teacher's private conversation
     is intentionally discarded — only the `# Advice:` line escapes."""
@@ -225,142 +439,86 @@ async def _teacher_advise(awm_base_url: str, scenario: str, task_idx: int,
     final_text: str = ""
     try:
         await env.connect()
-        await env.reset(scenario=scenario, task_idx=task_idx)
+        reset = await env.reset(scenario=scenario, task_idx=task_idx)
+        reset_observation = getattr(reset, "observation", None)
+        reset_error = getattr(reset_observation, "error", None)
+        if reset_error:
+            raise RuntimeError(f"teacher environment reset failed: {reset_error}")
         list_res = await env.step(ListToolsAction())
-        tools_text = format_tools(list_res.observation.tools)
         tools_schema = tools_to_openai_schema(list_res.observation.tools)
 
-        # 1) Replay student's executed tool_calls in order so the DB state
-        # matches. Any replay failure just means the teacher gets a slightly
-        # stale view — we still let it try.
-        for tc in past_tool_calls:
+        for tool_call in past_tool_calls:
             try:
                 await env.step(CallToolAction(
-                    tool_name=tc["tool_name"], arguments=tc["arguments"]))
+                    tool_name=tool_call["tool_name"],
+                    arguments=tool_call["arguments"],
+                ))
             except Exception:
                 replay_ok = False
 
-        # 2) Build initial teacher user message.
-        user_text = build_teacher_advice_input(
-            task=task,
-            student_conversation=student_messages,
-            verify_reward_type=verify_reward_type,
-            verify_error=verify_error
-        )
         messages: list[dict] = [
-            {"role": "system", "content": TEACHER_ADVICE_SYSTEM_PROMPT},
-            {"role": "user", "content": user_text},
+            {"role": "system", "content": teacher_system_prompt},
+            {"role": "user", "content": build_teacher_advice_input(
+                task=task,
+                student_conversation=student_messages,
+                verify_reward_type=verify_reward_type,
+                verify_error=verify_error,
+                verify_summary=verify_summary,
+                allow_tool_probes=max_tool_calls > 0,
+            )},
         ]
 
-        # 3) Probing phase: teacher can issue up to `max_tool_calls` read-only
-        # probes to inspect DB state. This phase produces NO advice — any
-        # non-tool-call output is ignored. The loop exits early if the teacher
-        # voluntarily stops calling tools.
         for step in range(1, max_tool_calls + 1):
             rounds_used = step
             try:
-                turn = await llm_turn_native(teacher_llm, messages,
-                                             tools=tools_schema,
-                                             temperature=temperature,
-                                             max_tokens=max_tokens,
-                                             tool_choice="auto")
-            except Exception as e:
-                error = f"teacher LLM error at probe step {step}: {e!r}"[:500]
+                turn = await llm_turn_native(
+                    teacher_llm,
+                    messages,
+                    tools=tools_schema,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tool_choice="auto",
+                )
+            except Exception as exc:
+                error = f"teacher LLM error at probe step {step}: {exc!r}"[:500]
                 break
-            tool_calls = turn.tool_calls
-            if not tool_calls:
-                # Teacher chose to stop probing early — proceed to finalize.
+            if not turn.tool_calls:
                 break
 
-            # Answer every native tool_call with a paired `role:tool` message
-            # (same tool_call_id) so the follow-up request stays valid.
-            for tc in tool_calls[:3]:
-                tc_id = tc.get("id", "")
-                fn = tc.get("function") or {}
-                name = fn.get("name", "")
-                raw_args = fn.get("arguments", "{}")
-                args = loads_lenient(raw_args) if isinstance(raw_args, str) else raw_args
-                if not isinstance(args, dict):
-                    args = {}
-
+            for tool_call in turn.tool_calls[:3]:
+                call_id, name, args = _parse_tool_call(tool_call)
                 tool_calls_made += 1
-                # Force read-only: refuse anything that looks state-mutating.
-                if name in ("verify", "done"):
-                    tool_response = "Error: teacher may not call verify/done. To finish, STOP calling tools and reply with your final answer as plain text."
-                else:
-                    try:
-                        tool_response = (
-                            await execute_native_tool_call(env, name, args)).text
-                    except Exception as e:
-                        tool_response = f"Error executing tool: {e!r}"
-                tool_response = (tool_response or "")[:tool_response_cap]
+                tool_response = await _execute_tool(
+                    env,
+                    name,
+                    args,
+                    forbidden_error=_TEACHER_FORBIDDEN_TOOL_ERROR,
+                    response_cap=tool_response_cap,
+                )
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tc_id,
+                    "tool_call_id": call_id,
                     "content": f"{tool_response}",
                 })
 
-        # 4) Finalize phase: swap system prompt so tools are forbidden and
-        # advice is mandatory. This is a SEPARATE LLM call — its only job is
-        # to emit the `# Advice: ...` block based on everything observed.
-        # The trailing user turn is REQUIRED: without an explicit "emit advice
-        # now" instruction the model tends to keep reasoning after the last
-        # tool response and never produce `content` (advice leaks into the
-        # reasoning channel / gets truncated) — the "finalize returned empty
-        # text" failure.
         finalize_messages = (
-            [{"role": "system", "content": TEACHER_FINALIZE_SYSTEM_PROMPT}]
-            + messages[1:]  # drop the old probing system prompt
-            + [{
-                "role": "user",
-                "content": (
-                    "Probing phase is over. Do NOT call any tools. "
-                    "Emit your final diagnosis now, starting with "
-                    "`# Advice:` on its own line."
-                ),
-            }]
+            [{"role": "system", "content": teacher_finalize_system_prompt}]
+            + messages[1:]
+            + [{"role": "user", "content": _TEACHER_FINALIZE_REQUEST}]
         )
         try:
             final_turn = await llm_turn_native(
                 teacher_llm, finalize_messages,
                 temperature=temperature, max_tokens=max_tokens)
-            final_text = final_turn.content or ""
-            # Safety net: with `--reasoning-parser` / Ark the advice can still
-            # land in the reasoning channel while `content` stays empty (e.g.
-            # response cut off by max_tokens). Fall back to reasoning so the
-            # advice isn't lost.
-            if not final_text.strip() and final_turn.reasoning:
-                final_text = final_turn.reasoning
-        except Exception as e:
-            error = f"teacher finalize failed: {e!r}"[:500]
+            final_text = _model_text(final_turn)
+        except Exception as exc:
+            error = f"teacher finalize failed: {exc!r}"[:500]
 
-        raw = final_text.strip()
-        # Strip any stray tool-call blocks the model might still emit.
-        raw_clean = re.sub(r"<tool_call>.*?</tool_call>", "", raw,
-                           flags=re.DOTALL).strip()
-        m = ADVICE_LINE_RE.search(raw_clean)
-        if m:
-            advice = m.group(1).strip()
-        elif raw_clean and len(raw_clean) > 20:
-            # Fallback: no explicit marker but we have prose — take it whole.
-            advice = raw_clean
-
-        # If advice is still missing, classify why so the caller can log a
-        # meaningful reason instead of a generic "no advice".
-        if advice is None and error is None:
-            if not raw:
-                error = "finalize returned empty text"
-            elif not raw_clean:
-                error = "finalize returned only <tool_call> blocks"
-            else:
-                error = f"finalize text unparseable (len={len(raw_clean)})"
-    except Exception as e:
-        error = f"teacher run failed: {e!r}"[:500]
+        advice, error = _extract_advice(final_text, error)
+    except Exception as exc:
+        error = f"teacher run failed: {exc!r}"[:500]
     finally:
-        try:
-            await env.close()
-        except Exception:
-            pass
+        await _close_quietly(env)
     return {
         "advice": advice,
         "rounds_used": rounds_used,
@@ -371,9 +529,124 @@ async def _teacher_advise(awm_base_url: str, scenario: str, task_idx: int,
     }
 
 
-# ---------------------------------------------------------------------------
-# RefineJob — one (scenario, task_idx). Emits one JSONL record per job.
-# ---------------------------------------------------------------------------
+def _verify_error(verify: dict) -> str | None:
+    observation_error = verify.get("error")
+    if observation_error:
+        return str(observation_error)[:400]
+    result = verify.get("verify_result") or {}
+    if not isinstance(result, dict):
+        return None
+    error = result.get("error") or result.get("message")
+    return error[:400] if isinstance(error, str) else error
+
+
+def _safe_score(value) -> float | None:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    return score if math.isfinite(score) else None
+
+
+def _verify_summary(verify: dict) -> str | None:
+    """Expose aggregate checker evidence without leaking verifier internals."""
+    result = verify.get("verify_result")
+    if not isinstance(result, dict):
+        return None
+    fields = []
+    score = _safe_score(verify.get("reward"))
+    if score is not None:
+        fields.append(f"score={score:.6g}")
+    for key in (
+        "passed_checks", "total_checks", "checker_errors",
+        "passed_tests", "total_tests", "all_passed", "format_error",
+        "compile_error", "timeouts", "runtime_errors",
+    ):
+        value = result.get(key)
+        if value is not None:
+            fields.append(f"{key}={value}")
+    return ", ".join(fields) or None
+
+
+def _score_outcome(rounds_detail: list[dict],
+                   success_at_round: int | None) -> dict:
+    """Summarize the score path and classify at most one training candidate."""
+    scored = [
+        (idx + 1, score)
+        for idx, detail in enumerate(rounds_detail)
+        if (score := _safe_score(detail.get("verify_reward"))) is not None
+    ]
+    baseline = scored[0][1] if scored else None
+    best_round, best = max(scored, key=lambda item: item[1]) if scored else (None, None)
+
+    sample_type = "no_improvement"
+    if success_at_round == 1:
+        sample_type = "complete_first_try"
+    elif success_at_round is not None:
+        sample_type = "complete_after_refine"
+    elif baseline is not None:
+        improved = [(round_no, score) for round_no, score in scored[1:]
+                    if score > baseline + 1e-9]
+        if improved:
+            best_value = max(score for _, score in improved)
+            best_round = next(round_no for round_no, score in improved
+                              if abs(score - best_value) <= 1e-12)
+            best = best_value
+            sample_type = "improved_partial"
+
+    return {
+        "baseline_score": baseline,
+        "best_score": best,
+        "best_round": best_round,
+        "score_improved": (
+            baseline is not None and best is not None and best > baseline + 1e-9
+        ),
+        "sample_candidate_type": sample_type,
+    }
+
+
+def _round_record(round_number: int, message_range: list[int],
+                  step: dict, verify: dict, judge: dict,
+                  final_reward_type: str, judge_fallback: bool) -> dict:
+    return {
+        "round": round_number,
+        "message_range": message_range,
+        "student_final_answer": step["final_answer"],
+        "student_steps": step["steps"],
+        "student_made_tool_call": step["made_tool_call"],
+        "student_error": step["error"],
+        "student_new_tool_calls": step["executed_tool_calls"],
+        "verify_reward": verify["reward"],
+        "verify_reward_type": verify["reward_type"],
+        "verify_result": verify.get("verify_result"),
+        "verify_error": _verify_error(verify),
+        "judge_classification": judge["classification"],
+        "judge_reasoning": judge["reasoning"],
+        "judge_confidence_score": judge["confidence_score"],
+        "judge_error": judge["error"],
+        "judge_fallback": judge_fallback,
+        "final_reward_type": final_reward_type,
+        "teacher_advice": None,
+        "teacher_rounds_used": 0,
+        "teacher_tool_calls_made": 0,
+        "teacher_replay_ok": None,
+        "teacher_error": None,
+        "teacher_final_raw": "",
+    }
+
+
+def _add_teacher_result(round_record: dict, teacher: dict) -> None:
+    for record_key, teacher_key in (
+        ("teacher_advice", "advice"),
+        ("teacher_rounds_used", "rounds_used"),
+        ("teacher_tool_calls_made", "tool_calls_made"),
+        ("teacher_replay_ok", "replay_ok"),
+        ("teacher_error", "error"),
+    ):
+        round_record[record_key] = teacher[teacher_key]
+    round_record["teacher_final_raw"] = teacher.get("final_raw", "")
+
+
 @dataclass
 class RefineJob:
     scenario: str
@@ -381,6 +654,12 @@ class RefineJob:
     student_llm: RetryLLM
     teacher_llm: RetryLLM | None
     awm_base_url: str
+    data_source: str = "awm"
+    student_system_prompt: str = STUDENT_NATIVE_SYSTEM_PROMPT
+    student_final_system_prompt: str = STUDENT_NATIVE_FINAL_SYSTEM_PROMPT
+    teacher_system_prompt: str = TEACHER_ADVICE_SYSTEM_PROMPT
+    teacher_finalize_system_prompt: str = TEACHER_FINALIZE_SYSTEM_PROMPT
+    include_verify_summary: bool = False
     only_infer: bool = True
     max_rounds: int = 3
     student_max_iterations: int = 10
@@ -391,9 +670,65 @@ class RefineJob:
     student_temperature: float = 1.0
     teacher_temperature: float = 0.4
     episode_timeout: float = 900.0
+    judge_llm: RetryLLM | None = None
+    use_llm_judge: bool = True
+    judge_authoritative: bool = True
+    judge_extra_body: dict | None = None
+    judge_temperature: float = 1.0
+    judge_max_tokens: int = 8192
+    judge_timeout: float = 180.0
 
     def key(self) -> tuple:
         return (self.scenario, self.task_idx)
+
+    async def _judge(self, task: str, messages: list[dict],
+                     step: dict, verify: dict) -> tuple[dict, str, bool]:
+        enabled = self.use_llm_judge and self.judge_llm is not None
+        judge = await _llm_judge_round(
+            self.judge_llm,
+            task=task,
+            round_messages=messages,
+            final_answer=step["final_answer"],
+            code_verify={
+                "reward_type": verify["reward_type"],
+                "verify_result": verify.get("verify_result"),
+            },
+            temperature=self.judge_temperature,
+            max_tokens=self.judge_max_tokens,
+            timeout=self.judge_timeout,
+            extra_body=self.judge_extra_body,
+        ) if enabled else _judge_result(None)
+        fallback = (self.judge_authoritative and enabled
+                    and judge["classification"] == "judge_error")
+        final_reward = verify["reward_type"]
+        if (self.judge_authoritative
+                and judge["classification"] in _JUDGE_CLASSIFICATIONS):
+            final_reward = judge["classification"]
+        return judge, final_reward, fallback
+
+    async def _advise(self, task: str, messages: list[dict],
+                      tool_calls: list[dict], reward_type: str,
+                      verify: dict) -> dict:
+        return await _teacher_advise(
+            awm_base_url=self.awm_base_url,
+            scenario=self.scenario,
+            task_idx=self.task_idx,
+            task=task,
+            student_messages=messages,
+            past_tool_calls=tool_calls,
+            verify_reward_type=reward_type,
+            verify_error=_verify_error(verify),
+            teacher_llm=self.teacher_llm,
+            max_iterations=self.teacher_max_iterations,
+            max_tool_calls=self.teacher_max_tool_calls,
+            max_tokens=self.teacher_max_tokens,
+            temperature=self.teacher_temperature,
+            verify_summary=(
+                _verify_summary(verify) if self.include_verify_summary else None
+            ),
+            teacher_system_prompt=self.teacher_system_prompt,
+            teacher_finalize_system_prompt=self.teacher_finalize_system_prompt,
+        )
 
     async def run(self) -> dict:
         t0 = time.monotonic()
@@ -405,6 +740,7 @@ class RefineJob:
         rounds_detail: list[dict] = []
         student_messages: list[dict] = []
         task_description: str = ""
+        task_id: str | None = None
         success = False
         success_at_round: int | None = None
         error: str | None = None
@@ -413,137 +749,102 @@ class RefineJob:
             await env.connect()
             reset_res = await env.reset(
                 scenario=self.scenario, task_idx=self.task_idx)
+            reset_error = getattr(reset_res.observation, "error", None)
+            if reset_error:
+                raise RuntimeError(f"environment reset failed: {reset_error}")
             task_description = reset_res.observation.task
+            task_id = getattr(reset_res.observation, "task_id", None)
             list_res = await env.step(ListToolsAction())
-            tools_text = format_tools(list_res.observation.tools)
             tools_schema = tools_to_openai_schema(list_res.observation.tools)
-
-            # Native function-calling: the tool schemas are supplied via the
-            # `tools` request field, so the student system prompt must NOT carry
-            # the XML/call_tool protocol (that would mislead the model). The
-            # tool signatures are still shown as text for the model's reference.
             student_messages = [
-                {"role": "system", "content": STUDENT_NATIVE_SYSTEM_PROMPT},
+                {"role": "system", "content": self.student_system_prompt},
                 {"role": "user", "content": task_description},
             ]
 
             for k in range(1, self.max_rounds + 1):
                 if k > 1:
-                    # Fresh DB state every round: mutations made by earlier
-                    # rounds are discarded so a corrupted state cannot cascade
-                    # into every later round. The conversation (incl. teacher
-                    # advice) carries over; only the env state is rebuilt.
-                    rr = await env.reset(scenario=self.scenario,
-                                         task_idx=self.task_idx)
-                turn_start_idx = len(student_messages)
-                step_result = await asyncio.wait_for(
+                    round_reset = await env.reset(
+                        scenario=self.scenario, task_idx=self.task_idx)
+                    reset_error = getattr(round_reset.observation, "error", None)
+                    if reset_error:
+                        raise RuntimeError(
+                            f"environment reset failed before round {k}: "
+                            f"{reset_error}")
+
+                start = len(student_messages)
+                step = await asyncio.wait_for(
                     _student_step(
                         env, self.student_llm, student_messages,
                         tools_schema,
                         max_iterations=self.student_max_iterations,
                         max_tokens=self.student_max_tokens,
                         temperature=self.student_temperature,
+                        final_system_prompt=self.student_final_system_prompt,
                     ),
                     timeout=self.episode_timeout,
                 )
-                student_messages = step_result["messages"]
-                turn_end_idx = len(student_messages)
-                new_executed = step_result["executed_tool_calls"]
-
-                verify = await _verify_only(env, step_result["final_answer"])
-
-                round_record = {
-                    "round": k,
-                    "message_range": [turn_start_idx, turn_end_idx],
-                    "student_final_answer": step_result["final_answer"],
-                    "student_steps": step_result["steps"],
-                    "student_made_tool_call": step_result["made_tool_call"],
-                    "student_error": step_result["error"],
-                    "student_new_tool_calls": new_executed,
-                    "verify_reward": verify["reward"],
-                    "verify_reward_type": verify["reward_type"],
-                    "teacher_advice": None,
-                    "teacher_rounds_used": 0,
-                    "teacher_tool_calls_made": 0,
-                    "teacher_replay_ok": None,
-                    "teacher_error": None,
-                    "teacher_final_raw": "",
-                }
+                student_messages = step["messages"]
+                verify = await _verify_only(env, step["final_answer"])
+                judge, final_reward_type, judge_fallback = await self._judge(
+                    task_description,
+                    student_messages[start:],
+                    step,
+                    verify,
+                )
+                round_record = _round_record(
+                    k,
+                    [start, len(student_messages)],
+                    step,
+                    verify,
+                    judge,
+                    final_reward_type,
+                    judge_fallback,
+                )
                 rounds_detail.append(round_record)
 
-                if verify["reward_type"] == "complete":
+                if final_reward_type == "complete":
                     success = True
                     success_at_round = k
                     break
-                if k == self.max_rounds:
+                if k == self.max_rounds or self.only_infer:
                     break
 
-                # Inference-only mode: skip the advice module entirely. The
-                # student attempts each task once (+ verify) with no teacher
-                # feedback carried into a next round.
-                if self.only_infer:
-                    break
-
-                # Ask the teacher for one line of advice. Uses a SEPARATE env
-                # session that we replay THIS ROUND's executed tool calls
-                # onto so its DB state matches the student's current state
-                # (earlier rounds' mutations were discarded by the reset).
-                verify_error = None
-                vr = verify.get("verify_result") or {}
-                if isinstance(vr, dict):
-                    verify_error = vr.get("error") or vr.get("message")
-                    if isinstance(verify_error, str):
-                        verify_error = verify_error[:400]
-                teacher = await _teacher_advise(
-                    awm_base_url=self.awm_base_url,
-                    scenario=self.scenario,
-                    task_idx=self.task_idx,
-                    task=task_description,
-                    student_messages=student_messages,
-                    past_tool_calls=new_executed,
-                    verify_reward_type=verify["reward_type"],
-                    verify_error=verify_error,
-                    teacher_llm=self.teacher_llm,
-                    max_iterations=self.teacher_max_iterations,
-                    max_tool_calls=self.teacher_max_tool_calls,
-                    max_tokens=self.teacher_max_tokens,
-                    temperature=self.teacher_temperature,
+                teacher = await self._advise(
+                    task_description,
+                    student_messages,
+                    step["executed_tool_calls"],
+                    final_reward_type,
+                    verify,
                 )
-                round_record["teacher_advice"] = teacher["advice"]
-                round_record["teacher_rounds_used"] = teacher["rounds_used"]
-                round_record["teacher_tool_calls_made"] = teacher["tool_calls_made"]
-                round_record["teacher_replay_ok"] = teacher["replay_ok"]
-                round_record["teacher_error"] = teacher["error"]
-                round_record["teacher_final_raw"] = teacher.get("final_raw", "")
+                _add_teacher_result(round_record, teacher)
 
                 if not teacher["advice"]:
-                    # Teacher failed to produce advice. Surface the specific
-                    # reason (empty text / only tool_call / unparseable / etc.)
-                    # so the top-level log is actionable.
                     reason = teacher.get("error") or "no advice; unknown reason"
                     error = (error or "") + f"[round {k}] teacher no-advice: {reason}; "
                     break
 
                 student_messages.append({
                     "role": "user",
-                    "content": f"[Expert advice]\n# Advice: {teacher['advice']}\n\nNotice: Your first tried failed and the environment has been reset to its initial state. please try again.",
+                    "content": _EXPERT_ADVICE_TEMPLATE.format(
+                        advice=teacher["advice"]),
                 })
 
         except asyncio.TimeoutError:
             error = f"episode timeout > {self.episode_timeout}s"
-        except Exception as e:
+        except Exception as exc:
             import traceback
-            error = f"refine run failed: {e!r} | tb: {traceback.format_exc()}"[:2000]
+            error = (
+                f"refine run failed: {exc!r} | tb: {traceback.format_exc()}"
+            )[:2000]
         finally:
-            try:
-                await env.close()
-            except Exception:
-                pass
+            await _close_quietly(env)
 
         elapsed = round(time.monotonic() - t0, 3)
-        return {
+        record = {
+            "data_source": self.data_source,
             "scenario": self.scenario,
             "task_idx": self.task_idx,
+            "task_id": task_id,
             "task": task_description,
             "max_rounds": self.max_rounds,
             "rounds": len(rounds_detail),
@@ -554,11 +855,10 @@ class RefineJob:
             "elapsed_sec": elapsed,
             "error": error,
         }
+        record.update(_score_outcome(rounds_detail, success_at_round))
+        return record
 
 
-# ---------------------------------------------------------------------------
-# Scenario listing (mirrors rollout.rollout.main).
-# ---------------------------------------------------------------------------
 async def _list_all_scenarios(awm_base_url: str) -> list[dict]:
     async with AWMEnv(base_url=awm_base_url) as env:
         list_res = await env.step(
@@ -566,82 +866,161 @@ async def _list_all_scenarios(awm_base_url: str) -> list[dict]:
         return list_res.observation.scenarios
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-async def main():
+def _code_judge_scenarios(base_url: str) -> list[dict]:
+    """Discover CodeJudge task count from its lightweight monitoring API."""
+    url = f"{base_url.rstrip('/')}/dataset"
+    with urllib.request.urlopen(url, timeout=30) as response:  # noqa: S310
+        payload = json.loads(response.read().decode("utf-8"))
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"CodeJudge dataset endpoint is unhealthy: {payload}")
+    task_count = int(payload.get("task_count") or 0)
+    if task_count < 1:
+        raise RuntimeError(f"CodeJudge reported invalid task_count={task_count}")
+    return [{"name": "taco", "num_tasks": task_count}]
+
+
+async def _discover_scenarios(profile: BackendProfile,
+                              base_url: str) -> list[dict]:
+    if profile.name == "deepcoder-taco":
+        return await asyncio.to_thread(_code_judge_scenarios, base_url)
+    return await _list_all_scenarios(base_url)
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    # scenario selection
-    parser.add_argument("--num-scenarios", type=int, default=1000)
-    parser.add_argument("--tasks-per-scenario", type=int, default=10)
+    add = parser.add_argument
+    add("--dataset", "--env-backend", dest="env_backend",
+        choices=("awm", "envscaler", "deepcoder-taco", "deepcoder_taco",
+                 "codejudge"), default="awm",
+        help="Dataset profile. EnvScaler and DeepCoder/TACO use their code "
+             "verifiers as ground truth and include every advertised task.")
+    add("--num-scenarios", type=int, default=1000)
+    add("--tasks-per-scenario", type=int, default=None,
+        help="Optional task cap per scenario. Defaults to 10 for AWM and all "
+             "advertised tasks for EnvScaler and DeepCoder/TACO.")
     parser.add_argument("--scenarios", default=None,
                         help="Comma-separated scenario names; overrides --num-scenarios.")
-    parser.add_argument("--start-scenario-idx", type=int, default=0)
-    parser.add_argument("--end-scenario-idx", type=int, default=None)
+    for option, default in (
+        ("--start-scenario-idx", 0),
+        ("--end-scenario-idx", None),
+    ):
+        add(option, type=int, default=default)
 
-    # rollout / refinement hyperparams
-    parser.add_argument("--only-infer", action=argparse.BooleanOptionalAction,
-                        default=False,
-                        help="Inference-only: run the student once per task and "
-                             "skip the teacher advice module. Pass --no-only-infer "
-                             "to enable the full refine (teacher-advice) loop.")
-    parser.add_argument("--max-rounds", type=int, default=3,
-                        help="Max number of student→verify→teacher_advice iterations.")
-    parser.add_argument("--student-max-iterations", type=int, default=4,
-                        help="Max LLM turns the student may take within ONE round.")
-    parser.add_argument("--student-max-tokens", type=int, default=2048)
-    parser.add_argument("--student-temperature", type=float, default=1.0)
-    parser.add_argument("--teacher-max-iterations", type=int, default=4)
-    parser.add_argument("--teacher-max-tool-calls", type=int, default=3)
-    parser.add_argument("--teacher-max-tokens", type=int, default=8192)
-    parser.add_argument("--teacher-temperature", type=float, default=0.4)
+    add("--only-infer", action=argparse.BooleanOptionalAction, default=False,
+        help="Inference-only: run the student once per task and skip the teacher "
+             "advice module. Pass --no-only-infer to enable the full refine "
+             "(teacher-advice) loop.")
+    add("--max-rounds", type=int, default=2,
+        help="Max number of student→verify→teacher_advice iterations.")
+    add("--student-max-iterations", type=int, default=None,
+        help="Max LLM turns within one round (AWM: 4; EnvScaler: 16; "
+             "DeepCoder/TACO: 1).")
+    for option, value_type, default in (
+        ("--student-temperature", float, 1.0),
+        ("--teacher-max-iterations", int, 4),
+        ("--teacher-max-tokens", int, 8192),
+        ("--teacher-temperature", float, 0.4),
+        ("--concurrency", int, 32),
+        ("--episode-timeout", float, 900.0),
+        ("--llm-timeout", float, 180.0),
+        ("--progress-interval", float, 10.0),
+    ):
+        add(option, type=value_type, default=default)
+    add("--student-max-tokens", type=int, default=None,
+        help="Defaults to 2048 for tool datasets and 8192 for code tasks.")
+    add("--teacher-max-tool-calls", type=int, default=None,
+        help="Defaults to 3 for tool datasets and 0 for CodeJudge.")
 
-    # concurrency / timeouts
-    parser.add_argument("--concurrency", type=int, default=32)
-    parser.add_argument("--episode-timeout", type=float, default=900.0)
-    parser.add_argument("--llm-timeout", type=float, default=180.0)
-    parser.add_argument("--progress-interval", type=float, default=10.0)
+    add("--env-base-url", "--awm-base-url", dest="awm_base_url", default=None,
+        help="Environment server URL (AWM_BASE_URL also supported).")
+    add("--student-base-url",
+        default=os.environ.get("ENDPOINT_URL", "http://localhost:8000/v1"))
+    add("--student-api-key", default=os.environ.get("OPENAI_API_KEY", "EMPTY"))
+    add("--student-model",
+        default=os.environ.get("AWM_EXAMPLE_AGENT_MODEL", "qwen3.5-4b"))
 
-    # student (vLLM local, OpenAI-compat)
-    parser.add_argument("--awm-base-url",
-                        default=os.environ.get("AWM_BASE_URL", "http://localhost:8899"))
-    parser.add_argument("--student-base-url",
-                        default=os.environ.get("ENDPOINT_URL", "http://localhost:8000/v1"))
-    parser.add_argument("--student-api-key",
-                        default=os.environ.get("OPENAI_API_KEY", "EMPTY"))
-    parser.add_argument("--student-model",
-                        default=os.environ.get("AWM_EXAMPLE_AGENT_MODEL", "qwen3.5-4b"))
-
-    # teacher (Ark by default; supports both seed and deepseek-v4-pro endpoints)
-    parser.add_argument("--teacher-base-url",
-                        default="https://ark.cn-beijing.volces.com/api/v3")
-    parser.add_argument("--teacher-api-key",
-                        default=os.environ.get("ARK_API_KEY"))
+    add("--teacher-base-url",
+        default=os.environ.get("TEACHER_BASE_URL",
+                               "https://ark.cn-beijing.volces.com/api/v3"),
+        help="Teacher endpoint. Defaults to $TEACHER_BASE_URL (.env), then the "
+             "Volcano Ark OpenAI-compatible URL.")
+    add("--teacher-api-key", default=os.environ.get("ARK_API_KEY"))
     parser.add_argument("--teacher-model",
                         default=os.environ.get("TEACHER_MODEL", "ep-20260707130305-26bjx"),
                         help="Ark endpoint id. e.g. seed-2.1-pro=ep-20260707130305-26bjx; "
                              "seed-2.0-lite / DeepSeek-v4-Pro have their own endpoints.")
-    parser.add_argument("--teacher-rpm", type=int, default=400)
-    parser.add_argument("--teacher-tpm", type=int, default=800_000)
+    add("--teacher-rpm", type=int, default=400)
+    add("--teacher-tpm", type=int, default=800_000)
 
-    # I/O
-    parser.add_argument("--output-jsonl",
-                        default="/mnt/storage/disk3/self_evolver/traj_data/refine_epoch1.jsonl")
-    parser.add_argument("--report",
-                        default="/mnt/storage/disk3/self_evolver/traj_data/refine_epoch1.json")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Optional cap on total (scenario,task) pairs.")
-    args = parser.parse_args()
+    add("--llm-judge", action=argparse.BooleanOptionalAction, default=None,
+        help="LLM-as-judge decides the final reward: success is judge "
+             "classification == 'complete', with the code verify result passed "
+             "to the judge as evidence. On a failed judge call the code verdict "
+             "is used (judge_fallback=True). --no-llm-judge restores "
+             "code-verify-only scoring.")
+    add("--judge-base-url", default=os.environ.get("JUDGE_BASE_URL"),
+        help="Defaults to $JUDGE_BASE_URL (.env), then --teacher-base-url.")
+    add("--judge-api-key", default=os.environ.get("JUDGE_API_KEY"),
+        help="Defaults to $JUDGE_API_KEY (.env), then --teacher-api-key "
+             "(ARK_API_KEY).")
+    add("--judge-model", default="ep-20260609014859-6th5f",
+        help="dpsk-v4-pro")
+    add("--judge-temperature", type=float, default=1.0,
+        help="1.0 matches the AWM server-side judge config (reasoning models want 1.0).")
+    for option, default in (
+        ("--judge-max-tokens", 8192),
+        ("--judge-rpm", 400),
+        ("--judge-tpm", 800_000),
+    ):
+        add(option, type=int, default=default)
+    add("--judge-timeout", type=float, default=None,
+        help="Per-call judge timeout in seconds; defaults to --llm-timeout.")
 
+    add("--output-jsonl", default=None)
+    add("--report", default=None)
+    add("--resume", action="store_true")
+    add("--limit", type=int, default=None,
+        help="Optional cap on total (scenario,task) pairs.")
+    return parser
+
+
+def _resolve_backend_args(args: argparse.Namespace) -> BackendProfile:
+    profile = _backend_profile(args.env_backend)
+    backend_url_env = {
+        "awm": "AWM_BASE_URL",
+        "envscaler": "ENVSCALER_BASE_URL",
+        "deepcoder-taco": "CODE_JUDGE_BASE_URL",
+    }[profile.name]
+    args.awm_base_url = (
+        args.awm_base_url
+        or os.environ.get("ENV_BASE_URL")
+        or os.environ.get(backend_url_env)
+        or profile.default_base_url
+    )
+    if args.tasks_per_scenario is None:
+        args.tasks_per_scenario = profile.default_tasks_per_scenario
+    if args.student_max_iterations is None:
+        args.student_max_iterations = profile.default_student_iterations
+    if args.student_max_tokens is None:
+        args.student_max_tokens = profile.default_student_max_tokens
+    if args.teacher_max_tool_calls is None:
+        args.teacher_max_tool_calls = profile.default_teacher_tool_calls
+    if args.llm_judge is None:
+        args.llm_judge = profile.default_llm_judge
+    data_dir = "/mnt/storage/disk3/self_evolver/traj_data"
+    args.output_jsonl = args.output_jsonl or f"{data_dir}/{profile.output_stem}.jsonl"
+    args.report = args.report or f"{data_dir}/{profile.output_stem}.json"
+    return profile
+
+
+def _build_llm_clients(args: argparse.Namespace) -> tuple[RetryLLM, RetryLLM | None,
+                                                           RetryLLM | None]:
     student_llm = RetryLLM(
         base_url=args.student_base_url,
         api_key=args.student_api_key,
         model=args.student_model,
         timeout=args.llm_timeout,
     )
-    # The teacher is only needed for the full refine (advice) loop. In
-    # inference-only mode we never build it, so no teacher API key is required.
     teacher_llm: RetryLLM | None = None
     if args.only_infer:
         print(f"[refine] student={args.student_model} teacher=<none> "
@@ -660,52 +1039,129 @@ async def main():
         print(f"[refine] student={args.student_model} teacher={args.teacher_model}")
         print(f"[refine] teacher rate limit: {args.teacher_rpm} RPM, {args.teacher_tpm} TPM")
 
-    all_scenarios = await _list_all_scenarios(args.awm_base_url)
-    print(f"Total scenarios on server: {len(all_scenarios)}")
-    if args.scenarios:
-        picked = [s.strip() for s in args.scenarios.split(",") if s.strip()]
+    judge_llm: RetryLLM | None = None
+    if args.llm_judge:
+        judge_base_url = args.judge_base_url or args.teacher_base_url
+        judge_api_key = args.judge_api_key or args.teacher_api_key
+        judge_model = args.judge_model or args.teacher_model
+        if not judge_api_key:
+            raise SystemExit(
+                "judge API key not set: export ARK_API_KEY or pass "
+                "--teacher-api-key/--judge-api-key (required when --llm-judge).")
+        shares_teacher = (
+            teacher_llm is not None
+            and judge_base_url == args.teacher_base_url
+            and judge_api_key == args.teacher_api_key
+            and judge_model == args.teacher_model
+        )
+        judge_llm = teacher_llm if shares_teacher else RetryLLM(
+            base_url=judge_base_url,
+            api_key=judge_api_key,
+            model=judge_model,
+            timeout=args.llm_timeout,
+            limiter=RateLimiter(rpm=args.judge_rpm, tpm=args.judge_tpm),
+        )
+        authority = ("final reward" if args.env_backend == "awm"
+                     else "advisory only; code verifier remains authoritative")
+        thinking = (", thinking=disabled" if args.env_backend == "awm" else "")
+        print(f"[refine] judge={judge_model} @ {judge_base_url} "
+              f"(llm_judge=True: {authority}"
+              f"{thinking}"
+              f"{', shares teacher client' if shares_teacher else ''})")
     else:
-        end = args.end_scenario_idx if args.end_scenario_idx is not None \
-              else args.start_scenario_idx + args.num_scenarios
-        picked = [s["name"] for s in all_scenarios[args.start_scenario_idx:end]]
+        print("[refine] judge=<none> (llm_judge=False: code verify decides success)")
+    return student_llm, teacher_llm, judge_llm
+
+
+async def _select_work(args: argparse.Namespace,
+                       profile: BackendProfile | None = None) -> list[tuple[str, int]]:
+    profile = profile or _backend_profile(args.env_backend)
+    all_scenarios = await _discover_scenarios(profile, args.awm_base_url)
+    print(f"Total scenarios on server: {len(all_scenarios)}")
+    by_name = {item["name"]: item for item in all_scenarios}
+    if args.scenarios:
+        picked = [name.strip() for name in args.scenarios.split(",") if name.strip()]
+        missing = [name for name in picked if name not in by_name]
+        if missing:
+            raise ValueError(f"unknown scenarios: {missing}")
+    else:
+        end = (args.end_scenario_idx if args.end_scenario_idx is not None
+               else args.start_scenario_idx + args.num_scenarios)
+        picked = [item["name"] for item in all_scenarios[args.start_scenario_idx:end]]
     print(f"Selected {len(picked)} scenarios (first 5: {picked[:5]})")
 
-    todo = [(s, t) for s in picked for t in range(args.tasks_per_scenario)]
-    if args.limit is not None:
-        todo = todo[: args.limit]
+    todo = []
+    for scenario in picked:
+        advertised = by_name[scenario].get("num_tasks")
+        if args.tasks_per_scenario is None:
+            if advertised is None:
+                raise ValueError(
+                    f"scenario {scenario!r} does not advertise num_tasks; "
+                    "pass --tasks-per-scenario explicitly")
+            task_count = int(advertised)
+        else:
+            task_count = args.tasks_per_scenario
+            if advertised is not None:
+                task_count = min(task_count, int(advertised))
+        todo.extend((scenario, task) for task in range(task_count))
+    return todo[:args.limit] if args.limit is not None else todo
+
+
+def _build_jobs(args: argparse.Namespace, profile: BackendProfile,
+                todo: list[tuple[str, int]],
+                student_llm: RetryLLM, teacher_llm: RetryLLM | None,
+                judge_llm: RetryLLM | None) -> list[RefineJob]:
+    judge_timeout = (args.judge_timeout if args.judge_timeout is not None
+                     else args.llm_timeout)
+    common = {
+        "student_llm": student_llm,
+        "teacher_llm": teacher_llm,
+        "awm_base_url": args.awm_base_url,
+        "data_source": profile.data_source,
+        "student_system_prompt": profile.student_system_prompt,
+        "student_final_system_prompt": profile.student_final_system_prompt,
+        "teacher_system_prompt": profile.teacher_system_prompt,
+        "teacher_finalize_system_prompt": profile.teacher_finalize_system_prompt,
+        "include_verify_summary": profile.include_verify_summary,
+        "only_infer": args.only_infer,
+        "max_rounds": args.max_rounds,
+        "student_max_iterations": args.student_max_iterations,
+        "teacher_max_iterations": args.teacher_max_iterations,
+        "teacher_max_tool_calls": args.teacher_max_tool_calls,
+        "student_max_tokens": args.student_max_tokens,
+        "teacher_max_tokens": args.teacher_max_tokens,
+        "student_temperature": args.student_temperature,
+        "teacher_temperature": args.teacher_temperature,
+        "episode_timeout": args.episode_timeout,
+        "judge_llm": judge_llm,
+        "use_llm_judge": args.llm_judge,
+        "judge_authoritative": profile.judge_authoritative,
+        "judge_extra_body": profile.judge_extra_body,
+        "judge_temperature": args.judge_temperature,
+        "judge_max_tokens": args.judge_max_tokens,
+        "judge_timeout": judge_timeout,
+    }
+    return [RefineJob(scenario=scenario, task_idx=task, **common)
+            for scenario, task in todo]
+
+
+async def main():
+    args = _build_parser().parse_args()
+    profile = _resolve_backend_args(args)
+    student_llm, teacher_llm, judge_llm = _build_llm_clients(args)
+    todo = await _select_work(args, profile)
+
+    print(f"[refine] backend={profile.name} env={args.awm_base_url}")
     print(f"[refine] {len(todo)} (scenario, task) pairs, "
           f"max_rounds={args.max_rounds}, concurrency={args.concurrency}")
-
-    jobs = [
-        RefineJob(
-            scenario=s,
-            task_idx=t,
-            student_llm=student_llm,
-            teacher_llm=teacher_llm,
-            awm_base_url=args.awm_base_url,
-            only_infer=args.only_infer,
-            max_rounds=args.max_rounds,
-            student_max_iterations=args.student_max_iterations,
-            teacher_max_iterations=args.teacher_max_iterations,
-            teacher_max_tool_calls=args.teacher_max_tool_calls,
-            student_max_tokens=args.student_max_tokens,
-            teacher_max_tokens=args.teacher_max_tokens,
-            student_temperature=args.student_temperature,
-            teacher_temperature=args.teacher_temperature,
-            episode_timeout=args.episode_timeout,
-        )
-        for (s, t) in todo
-    ]
-
-    ckpt = JsonlCheckpoint(args.output_jsonl,
-                            key_fields=("scenario", "task_idx"))
+    jobs = _build_jobs(
+        args, profile, todo, student_llm, teacher_llm, judge_llm)
+    ckpt = JsonlCheckpoint(args.output_jsonl, key_fields=("scenario", "task_idx"))
 
     t0 = time.monotonic()
     await run_jobs(jobs, args.concurrency, ckpt,
                    progress_interval=args.progress_interval, resume=args.resume)
-    elapsed = time.monotonic() - t0
-
-    _aggregate_and_print(ckpt, args, elapsed)
+    _aggregate_and_print(ckpt, args, time.monotonic() - t0)
 
 
 def _aggregate_and_print(ckpt: JsonlCheckpoint, args: argparse.Namespace,
@@ -713,19 +1169,42 @@ def _aggregate_and_print(ckpt: JsonlCheckpoint, args: argparse.Namespace,
     records = ckpt.read_all()
     n = len(records)
     n_success = sum(1 for r in records if r.get("success"))
+    details = [detail for record in records
+               for detail in (record.get("rounds_detail") or [])]
     n_with_advice = sum(
-        1 for r in records
-        for rd in (r.get("rounds_detail") or [])
-        if rd.get("teacher_advice")
+        1 for detail in details if detail.get("teacher_advice")
     )
-    round_dist: dict = {}
-    success_by_round: dict = {}
-    for r in records:
-        rd = r.get("rounds") or 0
-        round_dist[rd] = round_dist.get(rd, 0) + 1
-        if r.get("success"):
-            k = r.get("success_at_round")
-            success_by_round[k] = success_by_round.get(k, 0) + 1
+    round_dist = dict(Counter(r.get("rounds") or 0 for r in records))
+    success_by_round = dict(Counter(
+        r.get("success_at_round") for r in records if r.get("success")))
+    candidate_dist = dict(Counter(
+        r.get("sample_candidate_type", "unknown") for r in records))
+    score_deltas = [
+        best - baseline
+        for record in records
+        if (baseline := _safe_score(record.get("baseline_score"))) is not None
+        and (best := _safe_score(record.get("best_score"))) is not None
+    ]
+
+    judged = [detail for detail in details
+              if detail.get("judge_classification") in _JUDGE_CLASSIFICATIONS]
+    judge_dist = dict(Counter(
+        detail["judge_classification"] for detail in judged))
+    n_judge_runs = len(judged)
+    n_judge_agree = sum(
+        detail["judge_classification"] == detail.get("verify_reward_type")
+        for detail in judged
+    )
+    n_judge_flips = sum(
+        detail.get("verify_reward_type") is not None
+        and detail["judge_classification"] == "complete"
+        and detail["judge_classification"] != detail["verify_reward_type"]
+        for detail in judged
+    )
+    n_judge_fallback = sum(
+        detail.get("judge_classification") == "judge_error"
+        for detail in details
+    )
 
     report = {
         "config": vars(args),
@@ -735,19 +1214,39 @@ def _aggregate_and_print(ckpt: JsonlCheckpoint, args: argparse.Namespace,
         "num_advice_lines": n_with_advice,
         "rounds_distribution": round_dist,
         "success_by_round": success_by_round,
+        "sample_candidate_distribution": candidate_dist,
+        "mean_best_score_delta": (
+            sum(score_deltas) / len(score_deltas) if score_deltas else None
+        ),
+        "judge_classification_distribution": judge_dist,
+        "judge_runs": n_judge_runs,
+        "judge_code_agreement": (n_judge_agree / n_judge_runs) if n_judge_runs else None,
+        "judge_complete_flips": n_judge_flips,
+        "judge_fallbacks": n_judge_fallback,
         "elapsed_wall_sec": round(elapsed_wall_sec, 2),
     }
     with open(args.report, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
     print("=" * 80)
-    print("AWM Refine Report")
+    print(f"{getattr(args, 'env_backend', 'AWM')} Refine Report")
     print("=" * 80)
     print(f"Records:               {n}")
     print(f"Success (any round):   {n_success}  ({report['success_rate']:.2%})")
     print(f"Advice lines total:    {n_with_advice}")
     print(f"Rounds distribution:   {round_dist}")
     print(f"Success by round:      {success_by_round}")
+    print(f"Sample candidates:     {candidate_dist}")
+    print(f"Judge classifications: {judge_dist}")
+    if n_judge_runs:
+        print(f"Judge vs code agree:   {n_judge_agree}/{n_judge_runs}"
+              f" ({report['judge_code_agreement']:.2%})")
+    else:
+        print("Judge vs code agree:   n/a")
+    print(f"Judge complete flips:  {n_judge_flips}  "
+          f"(judge=complete where code!=complete)")
+    print(f"Judge fallbacks:       {n_judge_fallback}  "
+          f"(judge failed -> code verdict used)")
     print(f"Elapsed:               {elapsed_wall_sec:.1f}s")
     print(f"JSONL:                 {ckpt.path}")
     print(f"Report:                {args.report}")
