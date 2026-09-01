@@ -4,6 +4,8 @@
 *.parquet
 *.csv
 *.log
+*.pid
+.claude/
 traj_data
 skills
 __pycache__/
