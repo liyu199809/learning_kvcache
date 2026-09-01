@@ -53,6 +53,10 @@ class AWMObservation(Observation):
     scenario: str | None = Field(default=None, description="Current scenario name")
     task: str | None = Field(default=None, description="Current task description")
     task_idx: int | None = Field(default=None, description="Current task index")
+    task_id: str | None = Field(
+        default=None,
+        description="Stable dataset task id when provided by the environment",
+    )
     has_verifier: dict | bool | None = Field(
         default=None,
         description="Verifier support info: {sql: bool, code: bool} or legacy bool",

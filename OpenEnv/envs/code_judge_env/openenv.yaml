@@ -1,0 +1,6 @@
+spec_version: 1
+name: code_judge_env
+type: space
+runtime: fastapi
+app: envs.code_judge_env.server.app:app
+port: 8901

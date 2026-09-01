@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-judge-openenv"
+version = "0.1.0"
+description = "OpenEnv hidden-test judge for DeepCoder/TACO coding tasks"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv>=0.2.2",
+    "fastapi>=0.115.0",
+    "pydantic>=2.0.0",
+    "pyarrow>=15.0.0",
+    "uvicorn>=0.24.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0.3"]
+
+[project.scripts]
+server = "code_judge_env.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["code_judge_env", "code_judge_env.server"]
+
+[tool.setuptools.package-dir]
+"code_judge_env" = "."
+"code_judge_env.server" = "server"

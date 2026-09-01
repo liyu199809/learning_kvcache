@@ -1,0 +1,6 @@
+spec_version: 1
+name: env_scaler_env
+type: space
+runtime: fastapi
+app: envs.env_scaler_env.server.app:app
+port: 8900
