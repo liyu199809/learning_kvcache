@@ -76,16 +76,31 @@ def export(checkpoint: Path, prepared: Path, output: Path, dtype, copy_mode: str
         )
     if len(delta_names) + len(attention_names) != len(names):
         raise ValueError("Checkpoint contains unsupported trainable parameters")
-    if metadata.get("num_virtual_tokens") != 2048:
-        raise ValueError("Checkpoint Delta prefix length is not 2048")
-    if metadata.get("attention_num_virtual_tokens") != 256:
-        raise ValueError("Checkpoint attention prefix length is not 256")
-
     config = _read_json(prepared / "config.json")
     if config.get("architectures") != [
         "Qwen3_5HybridDeltaResidualAttentionPrefixForConditionalGeneration"
     ]:
         raise ValueError("Prepared model is not the hybrid prefix architecture")
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        raise ValueError("Prepared model config has no text_config")
+    delta_tokens = text_config.get("independent_delta_prefix_num_virtual_tokens")
+    attention_tokens = text_config.get("residual_attention_prefix_num_virtual_tokens")
+    if not isinstance(delta_tokens, int) or delta_tokens <= 0:
+        raise ValueError(f"Invalid prepared Delta prefix length: {delta_tokens!r}")
+    if not isinstance(attention_tokens, int) or attention_tokens <= 0:
+        raise ValueError(f"Invalid prepared attention prefix length: {attention_tokens!r}")
+    if metadata.get("num_virtual_tokens") != delta_tokens:
+        raise ValueError(
+            f"Checkpoint Delta prefix length {metadata.get('num_virtual_tokens')!r} "
+            f"does not match prepared G={delta_tokens}"
+        )
+    if metadata.get("attention_num_virtual_tokens") != attention_tokens:
+        raise ValueError(
+            f"Checkpoint attention prefix length "
+            f"{metadata.get('attention_num_virtual_tokens')!r} "
+            f"does not match prepared A={attention_tokens}"
+        )
     delta_shapes = _safetensor_shapes(prepared / DELTA_FILE)
     attention_shapes = _safetensor_shapes(prepared / ATTENTION_FILE)
     expected_shapes = {**delta_shapes, **attention_shapes}
@@ -136,6 +151,8 @@ def export(checkpoint: Path, prepared: Path, output: Path, dtype, copy_mode: str
             "output_dtype": str(dtype),
             "delta_prefix_tensors": len(delta_names),
             "attention_prefix_tensors": len(attention_names),
+            "delta_prefix_tokens": delta_tokens,
+            "attention_prefix_tokens": attention_tokens,
             "trainable_numel": sum(t.numel() for t in merged.values()),
         }
         (staging / "prefix_merge_manifest.json").write_text(
