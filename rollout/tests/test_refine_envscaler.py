@@ -71,6 +71,7 @@ def test_envscaler_backend_defaults_and_all_task_enumeration(monkeypatch):
     assert args.awm_base_url == "http://127.0.0.1:8900"
     assert args.tasks_per_scenario is None
     assert args.student_max_iterations == 16
+    assert args.teacher_timeout == 600.0
     assert args.llm_judge is False
     assert profile.data_source == "envscaler_rl"
     assert profile.judge_authoritative is False
@@ -87,6 +88,20 @@ def test_envscaler_backend_defaults_and_all_task_enumeration(monkeypatch):
         ("env_a_rl", 0), ("env_a_rl", 1),
         ("env_b_rl", 0), ("env_b_rl", 1), ("env_b_rl", 2),
     ]
+
+
+def test_teacher_timeout_is_independent_from_student_timeout():
+    args = refine._build_parser().parse_args([
+        "--dataset", "envscaler",
+        "--teacher-api-key", "test-key",
+    ])
+    refine._resolve_backend_args(args)
+    student, teacher, judge = refine._build_llm_clients(args)
+
+    assert student._timeout == 180.0
+    assert teacher is not None
+    assert teacher._timeout == 600.0
+    assert judge is None
 
 
 def test_deepcoder_profile_discovers_all_tasks(monkeypatch):

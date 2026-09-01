@@ -926,6 +926,10 @@ def _build_parser() -> argparse.ArgumentParser:
         ("--progress-interval", float, 10.0),
     ):
         add(option, type=value_type, default=default)
+    add("--teacher-timeout", type=float, default=600.0,
+        help="Per-call teacher timeout in seconds. Kept separate from "
+             "--llm-timeout because complex advice turns can be much slower "
+             "than student inference.")
     add("--student-max-tokens", type=int, default=None,
         help="Defaults to 2048 for tool datasets and 8192 for code tasks.")
     add("--teacher-max-tool-calls", type=int, default=None,
@@ -1033,11 +1037,12 @@ def _build_llm_clients(args: argparse.Namespace) -> tuple[RetryLLM, RetryLLM | N
             base_url=args.teacher_base_url,
             api_key=args.teacher_api_key,
             model=args.teacher_model,
-            timeout=args.llm_timeout,
+            timeout=args.teacher_timeout,
             limiter=RateLimiter(rpm=args.teacher_rpm, tpm=args.teacher_tpm),
         )
         print(f"[refine] student={args.student_model} teacher={args.teacher_model}")
-        print(f"[refine] teacher rate limit: {args.teacher_rpm} RPM, {args.teacher_tpm} TPM")
+        print(f"[refine] teacher rate limit: {args.teacher_rpm} RPM, "
+              f"{args.teacher_tpm} TPM; timeout={args.teacher_timeout:g}s")
 
     judge_llm: RetryLLM | None = None
     if args.llm_judge:
