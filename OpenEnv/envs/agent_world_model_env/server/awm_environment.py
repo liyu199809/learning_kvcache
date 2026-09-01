@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 from typing import Any
 from uuid import uuid4
@@ -55,6 +56,12 @@ def _classify_tool_error(error_msg: str) -> str:
     lower = error_msg.lower()
     if any(kw in lower for kw in _TOOL_NOT_FOUND_KEYWORDS):
         return "tool_not_found"
+    # A generated endpoint can raise Pydantic ValidationError while validating
+    # its *response*.  When the transport reports a 5xx this is a server defect,
+    # not malformed agent arguments, so check the HTTP class before keywords
+    # such as "validation" or "missing".
+    if re.search(r"\bstatus code:\s*5\d\d\b", lower):
+        return "server_error"
     if any(kw in lower for kw in _INVALID_ARGS_KEYWORDS):
         return "invalid_args"
     if any(kw in lower for kw in _TIMEOUT_KEYWORDS):

@@ -563,6 +563,150 @@ class TestScenarioManagerHelpers:
         assert "port=9999" in patched
         assert "FastApiMCP" in patched
 
+    def test_patch_env_code_disables_session_expiration(self):
+        from envs.agent_world_model_env.server.scenario_manager import _patch_env_code
+
+        code = (
+            "from sqlalchemy.orm import sessionmaker\n"
+            "SessionLocal = sessionmaker(autocommit=False, bind=engine)\n"
+        )
+        patched = _patch_env_code(code, "/tmp/new.db", "127.0.0.1", 9999)
+        assert "sessionmaker(expire_on_commit=False, autocommit=False" in patched
+
+    def test_datetime_fix_uses_private_alias_with_module_import(self):
+        from envs.agent_world_model_env.server.scenario_manager import _patch_env_code
+
+        code = (
+            "import datetime\n"
+            "from sqlalchemy import Column, DateTime\n"
+            "class Record:\n"
+            '    __tablename__ = "records"\n'
+            "    created_at = Column(DateTime)\n"
+            "class RecordResponse:\n"
+            "    model_config = ConfigDict(from_attributes=True)\n"
+            "    created_at: str\n"
+        )
+        patched = _patch_env_code(code, "/tmp/new.db", "127.0.0.1", 9999)
+        assert "from datetime import datetime as _AWMDatetime" in patched
+        assert "created_at: Optional[_AWMDatetime]" in patched
+        assert "created_at: datetime" not in patched
+
+    def test_patch_env_code_adds_response_alias_compatibility(self):
+        from envs.agent_world_model_env.server.scenario_manager import _patch_env_code
+
+        code = (
+            "class ShiftResponse(BaseModel):\n"
+            "    model_config = ConfigDict(from_attributes=True)\n"
+            '    shift_date_value: datetime = Field(..., serialization_alias="date")\n'
+        )
+        patched = _patch_env_code(code, "/tmp/new.db", "127.0.0.1", 9999)
+        assert "ConfigDict(from_attributes=True, populate_by_name=True)" in patched
+        assert 'validation_alias="date", serialization_alias="date"' in patched
+
+        plain_response = (
+            "class RangeResponse(BaseModel):\n"
+            '    from_date_str: str = Field(..., serialization_alias="from_date")\n'
+        )
+        patched_plain = _patch_env_code(
+            plain_response, "/tmp/new.db", "127.0.0.1", 9999
+        )
+        assert 'validation_alias="from_date"' in patched_plain
+        assert "ConfigDict(populate_by_name=True)" in patched_plain
+
+        request_model = (
+            "class ProgramCreateRequest(BaseModel):\n"
+            '    start_date_str: str = Field(..., serialization_alias="start_date")\n'
+        )
+        patched_request = _patch_env_code(
+            request_model, "/tmp/new.db", "127.0.0.1", 9999
+        )
+        assert 'validation_alias="start_date"' not in patched_request
+        assert 'serialization_alias="start_date"' in patched_request
+
+    def test_patch_env_code_repairs_schema_and_query_codegen_errors(self):
+        from envs.agent_world_model_env.server.scenario_manager import _patch_env_code
+
+        code = (
+            "specifications: Optional[Dict[str, float]] = Field(None)\n"
+            "q = q.join(TicketTag, TicketTag.ticket_id == Ticket.id).filter(TicketTag.tag == tag_val)\n"
+            "value = Integer.__clause_element__().count()\n"
+            "model = UpdateListingStatusOrderModel()\n"
+        )
+        patched = _patch_env_code(code, "/tmp/new.db", "127.0.0.1", 9999)
+        assert "specifications: Optional[Dict[str, object]]" in patched
+        assert "session.query(TicketTag.ticket_id)" in patched
+        assert "from sqlalchemy import func as _AWMFunc" in patched
+        assert "_AWMFunc.count()" in patched
+        assert "UpdateListingStatusListingModel" in patched
+
+    def test_patch_env_code_preserves_orm_metadata_lookups(self):
+        from envs.agent_world_model_env.server.scenario_manager import _patch_env_code
+
+        code = (
+            "class AssetResponse(BaseModel):\n"
+            "    model_config = ConfigDict(from_attributes=True)\n"
+            "    metadata_: Optional[Dict[str, object]] = Field(\n"
+            '        None, serialization_alias="metadata"\n'
+            "    )\n"
+        )
+        patched = _patch_env_code(code, "/tmp/new.db", "127.0.0.1", 9999)
+        assert 'validation_alias="metadata"' not in patched
+        assert 'serialization_alias="metadata"' in patched
+
+    def test_patch_env_code_uses_tolerant_datetime_for_known_bad_columns(self):
+        from envs.agent_world_model_env.server.scenario_manager import _patch_env_code
+
+        code = (
+            "from sqlalchemy import Column, DateTime\n"
+            "class AvailabilitySlot(Base):\n"
+            '    __tablename__ = "availability_slots"\n'
+            "    start_time = Column(DateTime)\n"
+            "    end_time = Column(DateTime)\n"
+            "class Unrelated(Base):\n"
+            '    __tablename__ = "unrelated"\n'
+            "    start_time = Column(DateTime)\n"
+        )
+        patched = _patch_env_code(code, "/tmp/new.db", "127.0.0.1", 9999)
+        assert "class _AWMTolerantDateTime" in patched
+        assert patched.count("Column(_AWMTolerantDateTime)") == 2
+        assert "class Unrelated(Base):" in patched
+        assert "    start_time = Column(DateTime)" in patched
+
+    def test_patch_env_code_handles_csv_values_in_json_list_columns(self):
+        from envs.agent_world_model_env.server.scenario_manager import _patch_env_code
+
+        code = "flags = json.loads(mi.allergen_flags) if mi.allergen_flags else []\n"
+        patched = _patch_env_code(code, "/tmp/new.db", "127.0.0.1", 9999)
+        assert "def _awm_json_list(value):" in patched
+        assert "flags = _awm_json_list(mi.allergen_flags)" in patched
+        assert 'str(value).split(",")' in patched
+
+    def test_patch_env_code_repairs_known_sqlalchemy_typos(self):
+        from envs.agent_world_model_env.server.scenario_manager import _patch_env_code
+
+        code = (
+            "q.order_by(Model.rank.desc().nullsLast()).filter(Model.id.in__([1]))\n"
+            'value.astimezone(datetime.utc)\n'
+            'now = datetime.utcnow()\n'
+        )
+        patched = _patch_env_code(code, "/tmp/new.db", "127.0.0.1", 9999)
+        assert ".nullslast()" in patched
+        assert ".in_([1])" in patched
+        assert "from datetime import timezone as _AWMTimezone" in patched
+        assert ".astimezone(_AWMTimezone.utc)" in patched
+        assert "datetime.utcnow()" in patched
+
+    def test_patch_env_code_removes_only_invalid_appointment_invoice_relation(self):
+        from envs.agent_world_model_env.server.scenario_manager import _patch_env_code
+
+        code = (
+            '    encounters = relationship("Encounter", back_populates="appointment")\n'
+            '    invoices = relationship("Invoice", back_populates="encounter")\n'
+            '    invoices = relationship("Invoice", back_populates="encounter")\n'
+        )
+        patched = _patch_env_code(code, "/tmp/new.db", "127.0.0.1", 9999)
+        assert patched.count('invoices = relationship("Invoice"') == 1
+
     def test_scenario_process_initial_state(self):
         from envs.agent_world_model_env.server.scenario_manager import ScenarioProcess
 
@@ -980,6 +1124,12 @@ class TestAWMEnvironmentUnit:
         )
         assert _classify_tool_error("Invalid argument: x") == "invalid_args"
         assert _classify_tool_error("missing required field") == "invalid_args"
+        assert (
+            _classify_tool_error(
+                "Status code: 500. Response: ValidationError: missing field"
+            )
+            == "server_error"
+        )
         assert _classify_tool_error("Operation timed out") == "timeout"
         assert _classify_tool_error("Connection refused") == "server_error"
 
