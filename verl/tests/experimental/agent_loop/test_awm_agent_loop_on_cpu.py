@@ -51,10 +51,21 @@ class FakeResult:
 
 
 class FakeClient:
-    def __init__(self, *, reset_error=None, step_error=None, verify_reward_type="complete", delay=0.0):
+    def __init__(
+        self,
+        *,
+        reset_error=None,
+        step_error=None,
+        verify_reward_type="complete",
+        verify_reward=None,
+        verify_result=None,
+        delay=0.0,
+    ):
         self.reset_error = reset_error
         self.step_error = step_error
         self.verify_reward_type = verify_reward_type
+        self.verify_reward = verify_reward
+        self.verify_result = verify_result
         self.delay = delay
         self.reset_calls = []
         self.step_calls = []
@@ -80,7 +91,10 @@ class FakeClient:
             if self.step_error and action["tool_name"] != "verify":
                 raise self.step_error
             if action["tool_name"] == "verify":
-                return FakeResult({"reward_type": self.verify_reward_type})
+                observation = {"reward_type": self.verify_reward_type}
+                if self.verify_result is not None:
+                    observation["verify_result"] = self.verify_result
+                return FakeResult(observation, reward=self.verify_reward)
             return FakeResult({"tool_result": {"stored": action["arguments"]["value"]}})
         finally:
             with self.guard:
@@ -99,6 +113,8 @@ def make_loop(client: FakeClient) -> AWMAgentLoop:
     loop._transport_error = ""
     loop._last_assistant_text = "final"
     loop._verify_reward_type = "not_verified"
+    loop._verify_reward = 0.0
+    loop._verify_result = None
     loop._close_error = ""
     loop.tokenizer = SimpleNamespace(eos_token="<eos>", pad_token="<pad>")
     loop.tools = {}
@@ -216,13 +232,33 @@ async def test_disconnect_fails_closed_without_retry_or_verify():
 
 @run_async_test
 @pytest.mark.parametrize("reward_type, expected", [("complete", 1.0), ("incomplete", 0.0), ("format_error", 0.0)])
-async def test_verify_uses_binary_reward(reward_type, expected):
+async def test_verify_falls_back_to_binary_reward(reward_type, expected):
     client = FakeClient(verify_reward_type=reward_type)
     loop = make_loop(client)
     await loop._reset_openenv(loop._normalize_env_config({"scenario": "s", "task_idx": 1}))
 
     assert await loop._verify() == expected
     assert loop._verify_reward_type == reward_type
+
+
+@run_async_test
+@pytest.mark.parametrize(
+    "reward_type, service_reward",
+    [("complete", 1.0), ("incomplete", 0.1), ("format_error", -1.0), ("incomplete", 0.5)],
+)
+async def test_verify_uses_service_reward_for_awm_and_envscaler(reward_type, service_reward):
+    verify_result = {"passed_checks": 1, "total_checks": 2}
+    client = FakeClient(
+        verify_reward_type=reward_type,
+        verify_reward=service_reward,
+        verify_result=verify_result,
+    )
+    loop = make_loop(client)
+    await loop._reset_openenv(loop._normalize_env_config({"scenario": "s", "task_idx": 1}))
+
+    assert await loop._verify() == service_reward
+    assert loop._verify_reward == service_reward
+    assert loop._verify_result == verify_result
 
 
 @run_async_test
@@ -274,6 +310,8 @@ async def test_run_records_reward_and_diagnostics(monkeypatch):
 
     assert output.reward_score == 1.0
     assert output.extra_fields["awm_reward_type"] == "complete"
+    assert output.extra_fields["env_reward"] == 1.0
+    assert output.extra_fields["env_reward_type"] == "complete"
     assert output.extra_fields["awm_final_answer"] == "task finished"
     assert output.extra_fields["reward_extra_info"]["awm_task_idx"] == 3
     assert [call["tool_name"] for call in client.step_calls] == ["set_value", "verify"]

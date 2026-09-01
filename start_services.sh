@@ -24,7 +24,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-/mnt/storage/disk3/self_evolver}"
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
 OPENENV_ROOT="${OPENENV_ROOT:-$PROJECT_ROOT/OpenEnv}"
 
-MODEL_PATH="${MODEL_PATH:-checkpoints/self_evolver_opsd/qwen3_5_4b_awm_opsd_fix_context/global_step_200/actor/huggingface_merged}" # /mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B
+MODEL_PATH="${MODEL_PATH:-/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B}" # /mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B
 MODEL_NAME="${MODEL_NAME:-qwen3.5-4b}"
 
 VLLM_PORT="${VLLM_PORT:-8000}"

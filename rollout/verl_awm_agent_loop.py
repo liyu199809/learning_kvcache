@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from typing import Any
 
 from openenv.core.generic_client import GenericEnvClient
@@ -40,6 +41,8 @@ class AWMAgentLoop(ToolAgentLoop):
         self._transport_error = ""
         self._last_assistant_text = ""
         self._verify_reward_type = "not_verified"
+        self._verify_reward = 0.0
+        self._verify_result = None
         self._close_error = ""
 
     @staticmethod
@@ -181,6 +184,7 @@ class AWMAgentLoop(ToolAgentLoop):
     async def _verify(self) -> float:
         if self._transport_failed or not self._reset_succeeded or self._env_client is None:
             self._verify_reward_type = "transport_error"
+            self._verify_reward = 0.0
             return 0.0
         action = {
             "type": "call_tool",
@@ -193,12 +197,41 @@ class AWMAgentLoop(ToolAgentLoop):
             except Exception as exc:
                 self._mark_transport_failed("verify", exc)
                 self._verify_reward_type = "transport_error"
+                self._verify_reward = 0.0
                 return 0.0
         observation = self._observation(result)
         self._verify_reward_type = str(observation.get("reward_type") or "unknown")
+        self._verify_result = observation.get("verify_result")
         if observation.get("error") and not self._transport_error:
             self._transport_error = f"verify: {observation['error']}"
-        return 1.0 if self._verify_reward_type == "complete" else 0.0
+
+        # OpenEnv services own their reward semantics. AWM returns its configured
+        # reward (normally complete=1, incomplete=0.1, format_error=-1), while
+        # EnvScaler returns checklist completion in [0, 1]. Trust that common
+        # wire field so both datasets can share this loop without source-specific
+        # branches. Keep the binary fallback for older AWM-compatible services.
+        # GenericEnvClient promotes Observation.reward to StepResult.reward on
+        # the wire, while simple/legacy clients may leave it in the observation.
+        raw_reward = getattr(result, "reward", None)
+        if raw_reward is None and isinstance(result, dict):
+            raw_reward = result.get("reward")
+        if raw_reward is None:
+            raw_reward = observation.get("reward")
+        if raw_reward is None:
+            reward = 1.0 if self._verify_reward_type == "complete" else 0.0
+        else:
+            try:
+                reward = float(raw_reward)
+            except (TypeError, ValueError):
+                reward = 0.0
+                if not self._transport_error:
+                    self._transport_error = f"verify: invalid reward {raw_reward!r}"
+            if not math.isfinite(reward):
+                reward = 0.0
+                if not self._transport_error:
+                    self._transport_error = f"verify: non-finite reward {raw_reward!r}"
+        self._verify_reward = reward
+        return reward
 
     async def _close_openenv(self) -> None:
         client, self._env_client = self._env_client, None
@@ -286,6 +319,11 @@ class AWMAgentLoop(ToolAgentLoop):
             "awm_reward_type": self._verify_reward_type,
             "awm_error": error,
             "awm_final_answer": self._last_assistant_text,
+            # Generic aliases are preferred by mixed-source training and eval;
+            # retain the awm_* fields above for existing consumers.
+            "env_reward": self._verify_reward,
+            "env_reward_type": self._verify_reward_type,
+            "env_verify_result": self._verify_result,
         }
         output.extra_fields.update(diagnostics)
         output.extra_fields.setdefault("reward_extra_info", {}).update(diagnostics)
