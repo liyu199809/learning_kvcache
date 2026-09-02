@@ -6,7 +6,7 @@ import pytest
 
 from agent_world_model_env.models import AWMObservation
 from rollout import refine
-from rollout.common import tools_to_openai_schema
+from rollout.common import RetryLLM, tools_to_openai_schema
 from rollout.refine2swift import convert
 
 
@@ -66,14 +66,18 @@ def _record(task_idx, details):
 def test_envscaler_backend_defaults_and_all_task_enumeration(monkeypatch):
     monkeypatch.delenv("ENV_BASE_URL", raising=False)
     monkeypatch.delenv("ENVSCALER_BASE_URL", raising=False)
+    monkeypatch.delenv("TEACHER_MODEL", raising=False)
     args = refine._build_parser().parse_args(["--env-backend", "envscaler"])
     profile = refine._resolve_backend_args(args)
     assert args.awm_base_url == "http://127.0.0.1:8900"
     assert args.tasks_per_scenario is None
     assert args.student_max_iterations == 16
+    assert args.teacher_max_tokens == 8192
+    assert args.teacher_model == "ep-20260707130305-26bjx"
     assert args.teacher_timeout == 600.0
     assert args.llm_judge is False
     assert profile.data_source == "envscaler_rl"
+    assert profile.reconnect_before_verify is False
     assert profile.judge_authoritative is False
 
     async def fake_list(_):
@@ -98,7 +102,7 @@ def test_teacher_timeout_is_independent_from_student_timeout():
     refine._resolve_backend_args(args)
     student, teacher, judge = refine._build_llm_clients(args)
 
-    assert student._timeout == 180.0
+    assert student._timeout == 600.0
     assert teacher is not None
     assert teacher._timeout == 600.0
     assert judge is None
@@ -107,16 +111,21 @@ def test_teacher_timeout_is_independent_from_student_timeout():
 def test_deepcoder_profile_discovers_all_tasks(monkeypatch):
     monkeypatch.delenv("ENV_BASE_URL", raising=False)
     monkeypatch.delenv("CODE_JUDGE_BASE_URL", raising=False)
+    monkeypatch.delenv("TEACHER_MODEL", raising=False)
     args = refine._build_parser().parse_args(
         ["--dataset", "deepcoder-taco"])
     profile = refine._resolve_backend_args(args)
     assert args.awm_base_url == "http://127.0.0.1:8901"
     assert args.tasks_per_scenario is None
     assert args.student_max_iterations == 1
-    assert args.student_max_tokens == 8192
+    assert args.student_max_tokens == 16384
+    assert args.teacher_max_tokens == 16384
+    assert args.teacher_model == "ep-20260716095030-rdv28"
     assert args.teacher_max_tool_calls == 0
     assert args.llm_judge is False
     assert profile.data_source == "deepcoder_taco"
+    assert profile.reconnect_before_verify is True
+    assert profile.student_extra_body == {"repetition_penalty": 1.0}
     assert profile.include_verify_summary is True
 
     async def fake_discover(_profile, _url):
@@ -127,6 +136,327 @@ def test_deepcoder_profile_discovers_all_tasks(monkeypatch):
     assert len(work) == 7436
     assert work[0] == ("taco", 0)
     assert work[-1] == ("taco", 7435)
+
+
+def test_teacher_model_override_beats_code_profile(monkeypatch):
+    monkeypatch.setenv("TEACHER_MODEL", "custom-teacher")
+    args = refine._build_parser().parse_args(["--dataset", "deepcoder-taco"])
+    refine._resolve_backend_args(args)
+    assert args.teacher_model == "custom-teacher"
+
+    args = refine._build_parser().parse_args([
+        "--dataset", "deepcoder-taco",
+        "--teacher-model", "cli-teacher",
+    ])
+    refine._resolve_backend_args(args)
+    assert args.teacher_model == "cli-teacher"
+
+
+def test_deepcoder_student_passes_repetition_penalty(monkeypatch):
+    captured = {}
+
+    async def fake_turn(*args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(content="```python\npass\n```", tool_calls=[])
+
+    monkeypatch.setattr(refine, "llm_turn_native", fake_turn)
+    profile = refine._backend_profile("deepcoder-taco")
+    result = asyncio.run(refine._student_step(
+        env=None,
+        llm=None,
+        messages=[{"role": "user", "content": "solve"}],
+        tools_schema=[],
+        max_iterations=1,
+        max_tokens=1024,
+        temperature=1.0,
+        extra_body=profile.student_extra_body,
+    ))
+
+    assert result["error"] is None
+    assert captured["extra_body"] == {"repetition_penalty": 1.0}
+
+
+def test_reasoning_without_answer_is_marked_as_student_error(monkeypatch):
+    async def fake_turn(*args, **kwargs):
+        return SimpleNamespace(
+            content="", tool_calls=[], reasoning="A concrete DP derivation")
+
+    monkeypatch.setattr(refine, "llm_turn_native", fake_turn)
+    result = asyncio.run(refine._student_step(
+        env=None,
+        llm=None,
+        messages=[{"role": "user", "content": "solve"}],
+        tools_schema=[],
+        max_iterations=1,
+        max_tokens=1024,
+        temperature=1.0,
+    ))
+
+    assert result["failure_type"] == "reasoning_without_answer"
+    assert "reasoning" in result["error"]
+    assert result["final_answer"] == ""
+
+
+def test_student_final_answer_is_not_truncated(monkeypatch):
+    complete_answer = "```python\n" + ("x" * 3000) + "\n```"
+
+    async def fake_turn(*args, **kwargs):
+        return SimpleNamespace(
+            content=complete_answer, tool_calls=[], reasoning="short plan")
+
+    monkeypatch.setattr(refine, "llm_turn_native", fake_turn)
+    result = asyncio.run(refine._student_step(
+        env=None,
+        llm=None,
+        messages=[{"role": "user", "content": "solve"}],
+        tools_schema=[],
+        max_iterations=1,
+        max_tokens=4096,
+        temperature=1.0,
+    ))
+
+    assert result["final_answer"] == complete_answer
+    assert result["trace"][0]["assistant"] == complete_answer
+    assert result["trace"][0]["reasoning"] == "short plan"
+
+
+def test_student_trace_keeps_full_tool_response(monkeypatch):
+    tool_call = {
+        "id": "call-1",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+    turns = iter([
+        SimpleNamespace(
+            content="", tool_calls=[tool_call], reasoning="call the tool"),
+        SimpleNamespace(
+            content="done", tool_calls=[], reasoning="finish"),
+    ])
+
+    async def fake_turn(*args, **kwargs):
+        return next(turns)
+
+    full_response = "r" * 100
+
+    async def fake_execute(*args, **kwargs):
+        return full_response
+
+    monkeypatch.setattr(refine, "llm_turn_native", fake_turn)
+    monkeypatch.setattr(refine, "_execute_tool", fake_execute)
+    result = asyncio.run(refine._student_step(
+        env=None,
+        llm=None,
+        messages=[{"role": "user", "content": "use a tool"}],
+        tools_schema=[{}],
+        max_iterations=2,
+        max_tokens=1024,
+        temperature=1.0,
+        tool_response_cap=10,
+    ))
+
+    assert result["trace"][1]["response"] == full_response
+    tool_message = next(
+        message for message in result["messages"]
+        if message.get("role") == "tool"
+    )
+    assert tool_message["content"].startswith("r" * 10)
+    assert not tool_message["content"].startswith("r" * 11)
+
+
+def test_full_teacher_answer_keeps_multiline_code():
+    text = "# Advice: Use DP.\n\n```python\nprint(42)\n```"
+    advice, error = refine._extract_advice(text, None, full_block=True)
+    assert error is None
+    assert advice == "Use DP.\n\n```python\nprint(42)\n```"
+
+
+def test_reasoning_only_routes_teacher_to_complete_solution(monkeypatch):
+    captured = {}
+
+    async def fake_teacher(**kwargs):
+        captured.update(kwargs)
+        return {"advice": "complete solution", "error": None}
+
+    monkeypatch.setattr(refine, "_teacher_advise", fake_teacher)
+    profile = refine._backend_profile("deepcoder-taco")
+    job = refine.RefineJob(
+        scenario="taco",
+        task_idx=0,
+        student_llm=None,
+        teacher_llm=object(),
+        awm_base_url="http://unused",
+        data_source=profile.data_source,
+        teacher_max_tokens=profile.default_teacher_max_tokens,
+    )
+    result = asyncio.run(job._advise(
+        task="problem",
+        messages=[],
+        tool_calls=[],
+        reward_type="incomplete",
+        verify={"verify_result": {}},
+        student_error="student generated reasoning but no final answer",
+        reasoning_without_answer=True,
+    ))
+
+    assert result["advice"] == "complete solution"
+    assert captured["full_advice"] is True
+    assert captured["max_tokens"] == 16384
+    assert "complete correct Python submission" in captured[
+        "teacher_system_prompt"]
+    assert "complete correct Python submission" in captured[
+        "teacher_finalize_system_prompt"]
+
+
+def test_code_teacher_without_tools_does_not_hold_environment(monkeypatch):
+    turn_kwargs = {}
+
+    def fail_if_environment_is_created(*args, **kwargs):
+        raise AssertionError("code teacher must not open an environment")
+
+    async def fake_turn(*args, **kwargs):
+        turn_kwargs.update(kwargs)
+        return SimpleNamespace(
+            content="# Advice: complete answer", tool_calls=[], reasoning="")
+
+    monkeypatch.setattr(refine, "AWMEnv", fail_if_environment_is_created)
+    monkeypatch.setattr(refine, "llm_turn_native", fake_turn)
+    result = asyncio.run(refine._teacher_advise(
+        awm_base_url="http://unused",
+        scenario="taco",
+        task_idx=0,
+        task="problem",
+        student_messages=[],
+        past_tool_calls=[],
+        verify_reward_type="format_error",
+        verify_error=None,
+        teacher_llm=object(),
+        max_tool_calls=0,
+    ))
+
+    assert result["advice"] == "complete answer"
+    assert result["error"] is None
+    assert turn_kwargs["stream"] is True
+
+
+def test_streaming_llm_collects_reasoning_content_and_usage():
+    captured = {}
+    usage = SimpleNamespace(total_tokens=12)
+
+    async def chunks():
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(
+                content=None, reasoning_content="plan ", model_extra={}))],
+            usage=None,
+        )
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(
+                content=None,
+                reasoning_content=None,
+                model_extra={"reasoning_content": "details"},
+            ))],
+            usage=None,
+        )
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(
+                content="answer", reasoning_content=None, model_extra={}))],
+            usage=None,
+        )
+        yield SimpleNamespace(choices=[], usage=usage)
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return chunks()
+
+    llm = object.__new__(RetryLLM)
+    llm._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions()))
+    llm._model = "teacher"
+    llm._timeout = 10.0
+    llm._retries = 0
+    llm._limiter = None
+
+    message = asyncio.run(llm.chat_message_stream(
+        [{"role": "user", "content": "solve"}],
+        temperature=0.4,
+        max_tokens=128,
+    ))
+
+    assert message.content == "answer"
+    assert message.reasoning_content == "plan details"
+    assert captured["stream"] is True
+    assert captured["stream_options"] == {"include_usage": True}
+
+
+def test_taco_disconnects_during_inference_and_reconnects_for_verify(
+        monkeypatch):
+    instances = []
+
+    class FakeEnv:
+        def __init__(self, **kwargs):
+            self.connected = False
+            self.closed = False
+            self.reset_calls = 0
+            instances.append(self)
+
+        async def connect(self):
+            self.connected = True
+            self.closed = False
+
+        async def reset(self, **kwargs):
+            self.reset_calls += 1
+            return SimpleNamespace(observation=SimpleNamespace(
+                error=None, task="problem", task_id="task-0"))
+
+        async def step(self, action):
+            return SimpleNamespace(observation=SimpleNamespace(tools=[]))
+
+        async def close(self):
+            self.closed = True
+            self.connected = False
+
+    async def fake_student(env, *args, **kwargs):
+        assert env.closed is True
+        return {
+            "messages": [],
+            "trace": [],
+            "final_answer": "```python\npass\n```",
+            "made_tool_call": False,
+            "executed_tool_calls": [],
+            "steps": 1,
+            "error": None,
+            "failure_type": None,
+        }
+
+    async def fake_verify(env, final_answer):
+        assert env.connected is True
+        assert env.closed is False
+        assert env.reset_calls == 1
+        return {
+            "reward": 1.0,
+            "reward_type": "complete",
+            "verify_result": {"all_passed": True},
+            "error": None,
+        }
+
+    monkeypatch.setattr(refine, "AWMEnv", FakeEnv)
+    monkeypatch.setattr(refine, "_student_step", fake_student)
+    monkeypatch.setattr(refine, "_verify_only", fake_verify)
+    job = refine.RefineJob(
+        scenario="taco",
+        task_idx=0,
+        student_llm=None,
+        teacher_llm=None,
+        awm_base_url="http://unused",
+        data_source="deepcoder_taco",
+        reconnect_before_verify=True,
+        only_infer=True,
+        max_rounds=1,
+    )
+    result = asyncio.run(job.run())
+
+    assert result["success"] is True
+    assert len(instances) == 2
+    assert all(env.closed for env in instances)
 
 
 def test_awm_judge_disables_thinking_without_changing_teacher(monkeypatch):

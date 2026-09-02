@@ -21,6 +21,7 @@ import json
 import os
 import re
 import time
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Iterable, NamedTuple, Protocol
 
 import json_repair
@@ -128,7 +129,10 @@ class RetryLLM:
     def __init__(self, base_url: str, api_key: str, model: str,
                  timeout: float = 120.0, retries: int = 3,
                  limiter: "RateLimiter | None" = None):
-        self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        # RetryLLM owns the retry policy. Disable the SDK's hidden retry layer
+        # so one logical attempt maps to one HTTP request.
+        self._client = AsyncOpenAI(
+            base_url=base_url, api_key=api_key, max_retries=0)
         self._model = model
         self._timeout = timeout
         self._retries = retries
@@ -209,6 +213,81 @@ class RetryLLM:
 
         return await self._call_with_retry(
             coro_fn=_create,
+            extract=lambda r: r.choices[0].message,
+            est_tokens=est,
+        )
+
+    async def chat_message_stream(self, messages: list[dict],
+                                  temperature: float = 1.0,
+                                  max_tokens: int = 2048,
+                                  extra_body: dict | None = None):
+        """Stream and aggregate one text-only chat response.
+
+        Ark reasoning models may spend minutes before a non-streaming response
+        produces any bytes, which lets an intermediate gateway close the idle
+        connection. Streaming keeps it active while preserving the same final
+        message shape consumed by ``llm_turn_native``. Tool calls deliberately
+        stay on ``chat_message`` because streaming tool-call deltas require a
+        separate structured merger.
+        """
+        est = estimate_tokens(messages) + max_tokens
+
+        async def _create_and_collect():
+            kwargs = dict(
+                model=self._model,
+                messages=messages,
+                temperature=temperature,
+                max_completion_tokens=max_tokens,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            if extra_body is not None:
+                kwargs["extra_body"] = extra_body
+            stream = await self._client.chat.completions.create(**kwargs)
+            content_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            usage = None
+            async for chunk in stream:
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                if delta is None:
+                    continue
+                content = getattr(delta, "content", None)
+                if content:
+                    content_parts.append(str(content))
+                reasoning = (
+                    getattr(delta, "reasoning_content", None)
+                    or getattr(delta, "reasoning", None)
+                )
+                if not reasoning:
+                    extra = getattr(delta, "model_extra", None) or {}
+                    if isinstance(extra, dict):
+                        reasoning = (
+                            extra.get("reasoning_content")
+                            or extra.get("reasoning")
+                        )
+                if reasoning:
+                    reasoning_parts.append(str(reasoning))
+
+            reasoning_text = "".join(reasoning_parts)
+            message = SimpleNamespace(
+                content="".join(content_parts),
+                reasoning_content=reasoning_text or None,
+                reasoning=reasoning_text or None,
+                tool_calls=None,
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)],
+                usage=usage,
+            )
+
+        return await self._call_with_retry(
+            coro_fn=_create_and_collect,
             extract=lambda r: r.choices[0].message,
             est_tokens=est,
         )
@@ -714,7 +793,8 @@ async def llm_turn_native(llm: "RetryLLM", messages: list[dict], *,
                         max_tokens: int,
                         tools: list[dict] = None,tool_choice: str = "auto",
                         system_override: str | None = None,
-                        extra_body: dict | None = None) -> LLMTurnNative:
+                        extra_body: dict | None = None,
+                        stream: bool = False) -> LLMTurnNative:
     """Native-function-calling counterpart of `llm_turn`. Calls the LLM with a
     `tools` schema, appends a proper native assistant message (content +
     `tool_calls` with ids, plus a persisted `reasoning` field) to `messages`,
@@ -741,10 +821,24 @@ async def llm_turn_native(llm: "RetryLLM", messages: list[dict], *,
     wire_messages = _prepare_native_messages(messages)
     if system_override is not None:
         wire_messages = _apply_system_override(wire_messages, system_override)
-    msg = await llm.chat_message(wire_messages, temperature=temperature,
-                                 max_tokens=max_tokens,
-                                 tools=tools, tool_choice=tool_choice,
-                                 extra_body=extra_body)
+    if stream:
+        if tools is not None:
+            raise ValueError("streaming native turns do not support tools")
+        msg = await llm.chat_message_stream(
+            wire_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_body=extra_body,
+        )
+    else:
+        msg = await llm.chat_message(
+            wire_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            extra_body=extra_body,
+        )
     raw_content = msg.content or ""
     reasoning = _extract_reasoning(msg)
     if reasoning is None:

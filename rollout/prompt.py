@@ -109,15 +109,19 @@ you completed. If the task is not fully complete, say so plainly."""
 
 CODE_JUDGE_STUDENT_SYSTEM_PROMPT = """\
 You are a competitive programmer. Solve the user's programming problem in \
-Python. Reason carefully about the input format, constraints, edge cases, and \
-algorithmic complexity.
+Python.
 
-Reason efficiently and stop analyzing once you have a sound algorithm and \
-implementation plan. Keep internal reasoning under roughly 3,000 tokens and \
-reserve at least 4,000 tokens for the final code. Never spend the full response \
-budget exploring alternatives. Before the budget runs low, end your reasoning \
-and submit the best complete runnable solution you have, even if you are not \
-fully certain. Reasoning without a code submission is always invalid.
+Reason in one forward pass: extract the requirements, choose the simplest sound \
+algorithm, confirm its state transition and complexity, check at most one \
+representative example, and then implement it immediately.
+
+Once an approach satisfies the constraints, analysis is finished. Do not \
+restate the problem, retrace the same example, compare more alternatives, or \
+re-prove conclusions you already established. Do not narrate self-doubt or use \
+self-dialogue such as "Wait", "maybe", "let me re-read", or "is it possible". \
+Reconsider an approach only after finding a concrete contradiction; minor \
+uncertainty is not a reason to delay coding. A complete runnable solution is \
+always better than unfinished reasoning.
 
 Your final response MUST contain the complete submission in the LAST fenced \
 Python block:
@@ -129,16 +133,20 @@ tests, explanations, or additional code blocks after it."""
 
 
 CODE_JUDGE_STUDENT_FINAL_SYSTEM_PROMPT = """\
-This is your final answer for a competitive-programming problem. Return a \
-complete Python solution in the LAST fenced Python block. Only that block is \
-executed against hidden tests. Check input parsing, output formatting, edge \
-cases, and complexity before answering.
+This is the only turn for a competitive-programming problem. Solve it in one \
+forward pass: identify the requirements, choose the simplest sound algorithm, \
+confirm its state transition and complexity, check at most one representative \
+example, and immediately write the complete Python solution.
 
-Think efficiently: stop once you have a sound solution, keep internal reasoning \
-under roughly 3,000 tokens, and reserve at least 4,000 tokens for the code. \
-Never use the entire response budget for reasoning. Before the budget runs low, \
-end your reasoning and output the best complete runnable solution you have, even \
-if uncertain. A response with reasoning but no code is invalid. Do not put \
+The moment an approach satisfies the constraints, stop analyzing and code it. \
+Do not restate the problem, repeatedly trace the sample, enumerate alternative \
+approaches, or re-prove a conclusion. Do not narrate self-correction with \
+phrases such as "Wait", "maybe", "let me re-read", or "is it possible". Only a \
+concrete contradiction justifies reconsideration; uncertainty alone does not.
+
+Return the complete submission in the LAST fenced Python block. Only that block \
+is executed against hidden tests. Ensure the code handles input, output, edge \
+cases, and complexity. A response without runnable code is invalid. Do not put \
 anything after the final code block."""
 
 
@@ -347,6 +355,24 @@ Start with `# Advice:`. Do not provide the complete solution, do not invent \
 hidden tests, and do not claim a specific bug unless the visible code supports it."""
 
 
+CODE_JUDGE_TEACHER_SOLUTION_SYSTEM_PROMPT = """\
+You are an expert competitive programmer recovering a failed student attempt. \
+The student produced substantive reasoning but no runnable answer. Solve the \
+problem yourself and provide a complete correct Python submission, together \
+with only the explanation needed to make the algorithm and implementation clear.
+
+Output one `# Advice:` block. End that block with the complete solution in a \
+fenced Python block. Do not invent hidden-test details."""
+
+
+CODE_JUDGE_TEACHER_SOLUTION_FINALIZE_SYSTEM_PROMPT = """\
+The student failed to emit any runnable answer. Recover the attempt by solving \
+the programming problem yourself. Return `# Advice:` followed by a concise \
+algorithm explanation and a complete correct Python submission in a fenced \
+Python block. This answer will be given directly to the student for its retry. \
+Do not stop at diagnosis or hints, and do not invent hidden-test details."""
+
+
 # LLM-as-judge for the refine pipeline. Taxonomy / priority order / JSON
 # output contract are aligned with the AWM server-side judge
 # (OpenEnv/envs/agent_world_model_env/server/verifier.py::run_llm_judge, which
@@ -453,6 +479,8 @@ def build_teacher_advice_input(task: str, student_conversation: list[dict],
                                 verify_reward_type: str,
                                 verify_error: str | None,
                                 verify_summary: str | None = None,
+                                student_error: str | None = None,
+                                request_complete_solution: bool = False,
                                 allow_tool_probes: bool = True,
                                 ) -> str:
     """Render the initial user message for the teacher-advisor turn.
@@ -473,6 +501,8 @@ def build_teacher_advice_input(task: str, student_conversation: list[dict],
     ]
     if verify_error:
         parts.append(f"error: {verify_error}")
+    if student_error:
+        parts.append(f"student_generation_error: {student_error}")
     if verify_summary:
         parts.append(f"verification_summary: {verify_summary}")
     parts.append("")
@@ -483,11 +513,18 @@ def build_teacher_advice_input(task: str, student_conversation: list[dict],
             "ONLY the final `# Advice: ...` line."
         )
     else:
-        parts.append(
-            "No diagnostic tools are available. Diagnose the visible attempt "
-            "and aggregate verifier feedback, then emit ONLY the final "
-            "`# Advice: ...` line."
-        )
+        if request_complete_solution:
+            parts.append(
+                "No diagnostic tools are available. Solve the task yourself "
+                "and emit `# Advice:` followed by a concise explanation and "
+                "the complete runnable solution in a fenced Python block."
+            )
+        else:
+            parts.append(
+                "No diagnostic tools are available. Diagnose the visible "
+                "attempt and aggregate verifier feedback, then emit ONLY the "
+                "final `# Advice: ...` line."
+            )
     return "\n".join(parts)
 
 
@@ -509,6 +546,16 @@ def _render_student_conversation(messages: list[dict],
         content = str(m.get("content") or "")[:max_chars_per_msg]
 
         if role == "assistant":
+            reasoning = str(m.get("reasoning") or "")
+            if reasoning:
+                if len(reasoning) > max_chars_per_msg:
+                    half = max_chars_per_msg // 2
+                    reasoning = (
+                        reasoning[:half]
+                        + "\n... (reasoning excerpt truncated) ...\n"
+                        + reasoning[-half:]
+                    )
+                lines.append(f"[{i:02d}] assistant reasoning: {reasoning}")
             tool_calls = m.get("tool_calls") or []
             if content:
                 lines.append(f"[{i:02d}] assistant: {content}")

@@ -48,6 +48,8 @@ from rollout.prompt import (
     CODE_JUDGE_STUDENT_SYSTEM_PROMPT,
     CODE_JUDGE_TEACHER_ADVICE_SYSTEM_PROMPT,
     CODE_JUDGE_TEACHER_FINALIZE_SYSTEM_PROMPT,
+    CODE_JUDGE_TEACHER_SOLUTION_FINALIZE_SYSTEM_PROMPT,
+    CODE_JUDGE_TEACHER_SOLUTION_SYSTEM_PROMPT,
     ENVSCALER_STUDENT_NATIVE_FINAL_SYSTEM_PROMPT,
     ENVSCALER_STUDENT_NATIVE_SYSTEM_PROMPT,
     JUDGE_SYSTEM_PROMPT,
@@ -99,6 +101,11 @@ _EXPERT_ADVICE_TEMPLATE = (
 # student calls keep their existing thinking behavior.
 _JUDGE_THINKING_OFF_BODY = {"thinking": {"type": "disabled"}}
 
+# vLLM-specific sampling option used only for DeepCoder/TACO student calls.
+_CODE_STUDENT_EXTRA_BODY = {"repetition_penalty": 1.0}
+_DEFAULT_TEACHER_MODEL = "ep-20260707130305-26bjx"
+_CODE_TEACHER_MODEL = "ep-20260716095030-rdv28"
+
 
 @dataclass(frozen=True)
 class BackendProfile:
@@ -108,10 +115,14 @@ class BackendProfile:
     default_tasks_per_scenario: int | None
     default_student_iterations: int
     default_student_max_tokens: int
+    default_teacher_model: str
+    default_teacher_max_tokens: int
     default_teacher_tool_calls: int
     default_llm_judge: bool
     judge_authoritative: bool
     judge_extra_body: dict | None
+    student_extra_body: dict | None
+    reconnect_before_verify: bool
     include_verify_summary: bool
     student_system_prompt: str
     student_final_system_prompt: str
@@ -133,10 +144,14 @@ def _backend_profile(name: str) -> BackendProfile:
             default_tasks_per_scenario=None,
             default_student_iterations=16,
             default_student_max_tokens=2048,
+            default_teacher_model=_DEFAULT_TEACHER_MODEL,
+            default_teacher_max_tokens=8192,
             default_teacher_tool_calls=3,
             default_llm_judge=False,
             judge_authoritative=False,
             judge_extra_body=None,
+            student_extra_body=None,
+            reconnect_before_verify=False,
             include_verify_summary=True,
             student_system_prompt=ENVSCALER_STUDENT_NATIVE_SYSTEM_PROMPT.format(
                 current_date=date.today().isoformat()),
@@ -152,11 +167,15 @@ def _backend_profile(name: str) -> BackendProfile:
             default_base_url="http://127.0.0.1:8901",
             default_tasks_per_scenario=None,
             default_student_iterations=1,
-            default_student_max_tokens=8192,
+            default_student_max_tokens=16384,
+            default_teacher_model=_CODE_TEACHER_MODEL,
+            default_teacher_max_tokens=16384,
             default_teacher_tool_calls=0,
             default_llm_judge=False,
             judge_authoritative=False,
             judge_extra_body=None,
+            student_extra_body=_CODE_STUDENT_EXTRA_BODY,
+            reconnect_before_verify=True,
             include_verify_summary=True,
             student_system_prompt=CODE_JUDGE_STUDENT_SYSTEM_PROMPT,
             student_final_system_prompt=CODE_JUDGE_STUDENT_FINAL_SYSTEM_PROMPT,
@@ -172,10 +191,14 @@ def _backend_profile(name: str) -> BackendProfile:
             default_tasks_per_scenario=10,
             default_student_iterations=4,
             default_student_max_tokens=2048,
+            default_teacher_model=_DEFAULT_TEACHER_MODEL,
+            default_teacher_max_tokens=8192,
             default_teacher_tool_calls=3,
             default_llm_judge=True,
             judge_authoritative=True,
             judge_extra_body=_JUDGE_THINKING_OFF_BODY,
+            student_extra_body=None,
+            reconnect_before_verify=False,
             include_verify_summary=False,
             student_system_prompt=STUDENT_NATIVE_SYSTEM_PROMPT,
             student_final_system_prompt=STUDENT_NATIVE_FINAL_SYSTEM_PROMPT,
@@ -199,7 +222,7 @@ def _parse_tool_call(tool_call: dict) -> tuple[str, str, dict]:
 
 
 async def _execute_tool(env, name: str, args: dict, *,
-                        forbidden_error: str, response_cap: int) -> str:
+                        forbidden_error: str) -> str:
     if name in _HARNESS_TOOLS:
         response = forbidden_error
     else:
@@ -207,7 +230,7 @@ async def _execute_tool(env, name: str, args: dict, *,
             response = (await execute_native_tool_call(env, name, args)).text
         except Exception as exc:
             response = f"Error executing tool: {exc!r}"
-    return (response or "")[:response_cap]
+    return response or ""
 
 
 def _model_text(turn) -> str:
@@ -243,6 +266,7 @@ async def _student_step(env, llm: RetryLLM, messages: list[dict],
                          tools_schema: list[dict],
                          max_iterations: int, max_tokens: int,
                          temperature: float,
+                         extra_body: dict | None = None,
                          tool_response_cap: int = 4000,
                          final_system_prompt: str =
                          STUDENT_NATIVE_FINAL_SYSTEM_PROMPT) -> dict:
@@ -250,6 +274,7 @@ async def _student_step(env, llm: RetryLLM, messages: list[dict],
     executed: list[dict] = []
     content = ""
     made_tool_call = False
+    failure_type: str | None = None
     error: str | None = None
     step_used = 0
 
@@ -267,13 +292,27 @@ async def _student_step(env, llm: RetryLLM, messages: list[dict],
                 system_override=(
                     final_system_prompt if is_last else None
                 ),
+                extra_body=extra_body,
             )
         except Exception as exc:
             error = f"student LLM error at step {step}: {exc!r}"[:500]
             break
 
         content = turn.content
-        trace.append({"step": step, "assistant": (content or "")[:2000]})
+        reasoning = getattr(turn, "reasoning", "") or ""
+        trace.append({
+            "step": step,
+            "assistant": content or "",
+            "reasoning": reasoning,
+        })
+
+        if (not content.strip() and not turn.tool_calls
+                and bool(reasoning.strip())):
+            failure_type = "reasoning_without_answer"
+            error = (
+                "student generated substantive reasoning but no final answer"
+            )
+            break
 
         if not turn.tool_calls:
             break
@@ -286,30 +325,30 @@ async def _student_step(env, llm: RetryLLM, messages: list[dict],
                 name,
                 args,
                 forbidden_error=_STUDENT_FORBIDDEN_TOOL_ERROR,
-                response_cap=tool_response_cap,
             )
             trace.append({
                 "step": step,
                 "tool": name,
                 "arguments": args,
-                "response": tool_response[:800],
+                "response": tool_response,
             })
             if name not in _HARNESS_TOOLS and not tool_response.startswith("Error"):
                 executed.append({"tool_name": name, "arguments": args})
             messages.append({
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": f"{tool_response}\n\nYou have {max_iterations-step-1} remaining opportunities for parallel tool calls. Once the count hits 0, you must respond to the user directly whether the task is completed or not.",
+                "content": f"{tool_response[:tool_response_cap]}\n\nYou have {max_iterations-step-1} remaining opportunities for parallel tool calls. Once the count hits 0, you must respond to the user directly whether the task is completed or not.",
             })
 
     return {
         "messages": messages,
         "trace": trace,
-        "final_answer": content[:2000],
+        "final_answer": content,
         "made_tool_call": made_tool_call,
         "executed_tool_calls": executed,
         "steps": step_used,
         "error": error,
+        "failure_type": failure_type,
     }
 
 
@@ -396,11 +435,16 @@ async def _llm_judge_round(judge_llm: RetryLLM, task: str,
     return result
 
 
-def _extract_advice(final_text: str, error: str | None) -> tuple[str | None, str | None]:
+def _extract_advice(final_text: str, error: str | None,
+                    full_block: bool = False) -> tuple[str | None, str | None]:
     raw = final_text.strip()
     clean = re.sub(r"<tool_call>.*?</tool_call>", "", raw,
                    flags=re.DOTALL).strip()
-    match = ADVICE_LINE_RE.search(clean)
+    pattern = (
+        re.compile(r"^\s*#?\s*[Aa]dvice\s*:\s*(.+)\Z", re.MULTILINE | re.DOTALL)
+        if full_block else ADVICE_LINE_RE
+    )
+    match = pattern.search(clean)
     advice = match.group(1).strip() if match else (clean if len(clean) > 20 else None)
     if advice is not None or error is not None:
         return advice, error
@@ -417,6 +461,7 @@ async def _teacher_advise(awm_base_url: str, scenario: str, task_idx: int,
                           verify_reward_type: str,
                           verify_error: str | None,
                           teacher_llm: RetryLLM,
+                          student_error: str | None = None,
                           max_iterations: int = 4,
                           max_tool_calls: int = 3,
                           max_tokens: int = 8192,
@@ -425,12 +470,13 @@ async def _teacher_advise(awm_base_url: str, scenario: str, task_idx: int,
                           verify_summary: str | None = None,
                           teacher_system_prompt: str = TEACHER_ADVICE_SYSTEM_PROMPT,
                           teacher_finalize_system_prompt: str =
-                          TEACHER_FINALIZE_SYSTEM_PROMPT) -> dict:
+                          TEACHER_FINALIZE_SYSTEM_PROMPT,
+                          full_advice: bool = False) -> dict:
     """Return {'advice': str | None, 'rounds_used': int, 'tool_calls_made': int,
     'replay_ok': bool, 'error': str | None}. The teacher's private conversation
-    is intentionally discarded — only the `# Advice:` line escapes."""
-    env = AWMEnv(base_url=awm_base_url,
-                 message_timeout_s=180.0, connect_timeout_s=60.0)
+    is intentionally discarded. Normal paths retain one advice block; recovery
+    paths may retain a complete multiline solution."""
+    env = None
     advice: str | None = None
     rounds_used = 0
     tool_calls_made = 0
@@ -438,23 +484,28 @@ async def _teacher_advise(awm_base_url: str, scenario: str, task_idx: int,
     error: str | None = None
     final_text: str = ""
     try:
-        await env.connect()
-        reset = await env.reset(scenario=scenario, task_idx=task_idx)
-        reset_observation = getattr(reset, "observation", None)
-        reset_error = getattr(reset_observation, "error", None)
-        if reset_error:
-            raise RuntimeError(f"teacher environment reset failed: {reset_error}")
-        list_res = await env.step(ListToolsAction())
-        tools_schema = tools_to_openai_schema(list_res.observation.tools)
+        tools_schema: list[dict] = []
+        if max_tool_calls > 0:
+            env = AWMEnv(base_url=awm_base_url,
+                         message_timeout_s=180.0, connect_timeout_s=60.0)
+            await env.connect()
+            reset = await env.reset(scenario=scenario, task_idx=task_idx)
+            reset_observation = getattr(reset, "observation", None)
+            reset_error = getattr(reset_observation, "error", None)
+            if reset_error:
+                raise RuntimeError(
+                    f"teacher environment reset failed: {reset_error}")
+            list_res = await env.step(ListToolsAction())
+            tools_schema = tools_to_openai_schema(list_res.observation.tools)
 
-        for tool_call in past_tool_calls:
-            try:
-                await env.step(CallToolAction(
-                    tool_name=tool_call["tool_name"],
-                    arguments=tool_call["arguments"],
-                ))
-            except Exception:
-                replay_ok = False
+            for tool_call in past_tool_calls:
+                try:
+                    await env.step(CallToolAction(
+                        tool_name=tool_call["tool_name"],
+                        arguments=tool_call["arguments"],
+                    ))
+                except Exception:
+                    replay_ok = False
 
         messages: list[dict] = [
             {"role": "system", "content": teacher_system_prompt},
@@ -464,6 +515,8 @@ async def _teacher_advise(awm_base_url: str, scenario: str, task_idx: int,
                 verify_reward_type=verify_reward_type,
                 verify_error=verify_error,
                 verify_summary=verify_summary,
+                student_error=student_error,
+                request_complete_solution=full_advice,
                 allow_tool_probes=max_tool_calls > 0,
             )},
         ]
@@ -493,12 +546,11 @@ async def _teacher_advise(awm_base_url: str, scenario: str, task_idx: int,
                     name,
                     args,
                     forbidden_error=_TEACHER_FORBIDDEN_TOOL_ERROR,
-                    response_cap=tool_response_cap,
                 )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": f"{tool_response}",
+                    "content": tool_response[:tool_response_cap],
                 })
 
         finalize_messages = (
@@ -509,23 +561,26 @@ async def _teacher_advise(awm_base_url: str, scenario: str, task_idx: int,
         try:
             final_turn = await llm_turn_native(
                 teacher_llm, finalize_messages,
-                temperature=temperature, max_tokens=max_tokens)
+                temperature=temperature, max_tokens=max_tokens,
+                stream=True)
             final_text = _model_text(final_turn)
         except Exception as exc:
             error = f"teacher finalize failed: {exc!r}"[:500]
 
-        advice, error = _extract_advice(final_text, error)
+        advice, error = _extract_advice(
+            final_text, error, full_block=full_advice)
     except Exception as exc:
         error = f"teacher run failed: {exc!r}"[:500]
     finally:
-        await _close_quietly(env)
+        if env is not None:
+            await _close_quietly(env)
     return {
         "advice": advice,
         "rounds_used": rounds_used,
         "tool_calls_made": tool_calls_made,
         "replay_ok": replay_ok,
         "error": error,
-        "final_raw": (final_text or "")[:800],
+        "final_raw": final_text or "",
     }
 
 
@@ -612,9 +667,11 @@ def _round_record(round_number: int, message_range: list[int],
         "round": round_number,
         "message_range": message_range,
         "student_final_answer": step["final_answer"],
+        "student_trace": step["trace"],
         "student_steps": step["steps"],
         "student_made_tool_call": step["made_tool_call"],
         "student_error": step["error"],
+        "student_failure_type": step.get("failure_type"),
         "student_new_tool_calls": step["executed_tool_calls"],
         "verify_reward": verify["reward"],
         "verify_reward_type": verify["reward_type"],
@@ -668,6 +725,8 @@ class RefineJob:
     student_max_tokens: int = 2048
     teacher_max_tokens: int = 1024
     student_temperature: float = 1.0
+    student_extra_body: dict | None = None
+    reconnect_before_verify: bool = False
     teacher_temperature: float = 0.4
     episode_timeout: float = 900.0
     judge_llm: RetryLLM | None = None
@@ -708,7 +767,11 @@ class RefineJob:
 
     async def _advise(self, task: str, messages: list[dict],
                       tool_calls: list[dict], reward_type: str,
-                      verify: dict) -> dict:
+                      verify: dict, student_error: str | None = None,
+                      reasoning_without_answer: bool = False) -> dict:
+        recover_with_solution = (
+            reasoning_without_answer and self.data_source == "deepcoder_taco"
+        )
         return await _teacher_advise(
             awm_base_url=self.awm_base_url,
             scenario=self.scenario,
@@ -718,6 +781,7 @@ class RefineJob:
             past_tool_calls=tool_calls,
             verify_reward_type=reward_type,
             verify_error=_verify_error(verify),
+            student_error=student_error,
             teacher_llm=self.teacher_llm,
             max_iterations=self.teacher_max_iterations,
             max_tool_calls=self.teacher_max_tool_calls,
@@ -726,17 +790,28 @@ class RefineJob:
             verify_summary=(
                 _verify_summary(verify) if self.include_verify_summary else None
             ),
-            teacher_system_prompt=self.teacher_system_prompt,
-            teacher_finalize_system_prompt=self.teacher_finalize_system_prompt,
+            teacher_system_prompt=(
+                CODE_JUDGE_TEACHER_SOLUTION_SYSTEM_PROMPT
+                if recover_with_solution else self.teacher_system_prompt
+            ),
+            teacher_finalize_system_prompt=(
+                CODE_JUDGE_TEACHER_SOLUTION_FINALIZE_SYSTEM_PROMPT
+                if recover_with_solution else self.teacher_finalize_system_prompt
+            ),
+            full_advice=recover_with_solution,
         )
 
     async def run(self) -> dict:
         t0 = time.monotonic()
-        env = AWMEnv(
-            base_url=self.awm_base_url,
-            message_timeout_s=self.episode_timeout,
-            connect_timeout_s=60.0,
-        )
+
+        def new_env():
+            return AWMEnv(
+                base_url=self.awm_base_url,
+                message_timeout_s=self.episode_timeout,
+                connect_timeout_s=60.0,
+            )
+
+        env = new_env()
         rounds_detail: list[dict] = []
         student_messages: list[dict] = []
         task_description: str = ""
@@ -760,9 +835,11 @@ class RefineJob:
                 {"role": "system", "content": self.student_system_prompt},
                 {"role": "user", "content": task_description},
             ]
+            if self.reconnect_before_verify:
+                await _close_quietly(env)
 
             for k in range(1, self.max_rounds + 1):
-                if k > 1:
+                if k > 1 and not self.reconnect_before_verify:
                     round_reset = await env.reset(
                         scenario=self.scenario, task_idx=self.task_idx)
                     reset_error = getattr(round_reset.observation, "error", None)
@@ -779,11 +856,33 @@ class RefineJob:
                         max_iterations=self.student_max_iterations,
                         max_tokens=self.student_max_tokens,
                         temperature=self.student_temperature,
+                        extra_body=self.student_extra_body,
                         final_system_prompt=self.student_final_system_prompt,
                     ),
                     timeout=self.episode_timeout,
                 )
                 student_messages = step["messages"]
+                if self.reconnect_before_verify:
+                    env = new_env()
+                    await env.connect()
+                    verify_reset = await env.reset(
+                        scenario=self.scenario, task_idx=self.task_idx)
+                    reset_error = getattr(
+                        verify_reset.observation, "error", None)
+                    if reset_error:
+                        raise RuntimeError(
+                            f"environment reset failed before verify round "
+                            f"{k}: {reset_error}"
+                        )
+                    rebound_task_id = getattr(
+                        verify_reset.observation, "task_id", None)
+                    if (task_id is not None and rebound_task_id is not None
+                            and rebound_task_id != task_id):
+                        raise RuntimeError(
+                            "environment rebound to a different task before "
+                            f"verify: expected {task_id!r}, got "
+                            f"{rebound_task_id!r}"
+                        )
                 verify = await _verify_only(env, step["final_answer"])
                 judge, final_reward_type, judge_fallback = await self._judge(
                     task_description,
@@ -809,12 +908,19 @@ class RefineJob:
                 if k == self.max_rounds or self.only_infer:
                     break
 
+                if self.reconnect_before_verify:
+                    await _close_quietly(env)
+
                 teacher = await self._advise(
                     task_description,
                     student_messages,
                     step["executed_tool_calls"],
                     final_reward_type,
                     verify,
+                    student_error=step["error"],
+                    reasoning_without_answer=(
+                        step["failure_type"] == "reasoning_without_answer"
+                    ),
                 )
                 _add_teacher_result(round_record, teacher)
 
@@ -918,11 +1024,10 @@ def _build_parser() -> argparse.ArgumentParser:
     for option, value_type, default in (
         ("--student-temperature", float, 1.0),
         ("--teacher-max-iterations", int, 4),
-        ("--teacher-max-tokens", int, 8192),
         ("--teacher-temperature", float, 0.4),
         ("--concurrency", int, 32),
-        ("--episode-timeout", float, 900.0),
-        ("--llm-timeout", float, 180.0),
+        ("--episode-timeout", float, 1200.0),
+        ("--llm-timeout", float, 600.0),
         ("--progress-interval", float, 10.0),
     ):
         add(option, type=value_type, default=default)
@@ -930,8 +1035,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Per-call teacher timeout in seconds. Kept separate from "
              "--llm-timeout because complex advice turns can be much slower "
              "than student inference.")
+    add("--teacher-max-tokens", type=int, default=None,
+        help="Defaults to 16384 for code tasks and 8192 for tool tasks.")
     add("--student-max-tokens", type=int, default=None,
-        help="Defaults to 2048 for tool datasets and 8192 for code tasks.")
+        help="Defaults to 2048 for tool datasets and 16384 for code tasks.")
     add("--teacher-max-tool-calls", type=int, default=None,
         help="Defaults to 3 for tool datasets and 0 for CodeJudge.")
 
@@ -949,10 +1056,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Teacher endpoint. Defaults to $TEACHER_BASE_URL (.env), then the "
              "Volcano Ark OpenAI-compatible URL.")
     add("--teacher-api-key", default=os.environ.get("ARK_API_KEY"))
-    parser.add_argument("--teacher-model",
-                        default=os.environ.get("TEACHER_MODEL", "ep-20260707130305-26bjx"),
-                        help="Ark endpoint id. e.g. seed-2.1-pro=ep-20260707130305-26bjx; "
-                             "seed-2.0-lite / DeepSeek-v4-Pro have their own endpoints.")
+    parser.add_argument(
+        "--teacher-model",
+        default=None,
+        help="Ark endpoint id. Defaults by dataset profile; TEACHER_MODEL can "
+             "override it.",
+    )
     add("--teacher-rpm", type=int, default=400)
     add("--teacher-tpm", type=int, default=800_000)
 
@@ -1007,6 +1116,12 @@ def _resolve_backend_args(args: argparse.Namespace) -> BackendProfile:
         args.student_max_iterations = profile.default_student_iterations
     if args.student_max_tokens is None:
         args.student_max_tokens = profile.default_student_max_tokens
+    if args.teacher_model is None:
+        args.teacher_model = (
+            os.environ.get("TEACHER_MODEL") or profile.default_teacher_model
+        )
+    if args.teacher_max_tokens is None:
+        args.teacher_max_tokens = profile.default_teacher_max_tokens
     if args.teacher_max_tool_calls is None:
         args.teacher_max_tool_calls = profile.default_teacher_tool_calls
     if args.llm_judge is None:
@@ -1136,6 +1251,8 @@ def _build_jobs(args: argparse.Namespace, profile: BackendProfile,
         "student_max_tokens": args.student_max_tokens,
         "teacher_max_tokens": args.teacher_max_tokens,
         "student_temperature": args.student_temperature,
+        "student_extra_body": profile.student_extra_body,
+        "reconnect_before_verify": profile.reconnect_before_verify,
         "teacher_temperature": args.teacher_temperature,
         "episode_timeout": args.episode_timeout,
         "judge_llm": judge_llm,
