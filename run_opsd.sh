@@ -59,11 +59,11 @@
 # =============================================================================
 set -euo pipefail
 
-REPO=/mnt/storage/disk3/self_evolver
+REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$REPO"
 source .venv/bin/activate
 
-MODEL=/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B #/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B
+MODEL=${MODEL:-/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B}
 DATASET="$REPO/traj_data/task1/swift_opsd.jsonl"
 
 # GPUs. Default excludes GPU 0 (standing server). Free GPU 0 later, then use
