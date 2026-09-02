@@ -568,6 +568,20 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
 
+    def test_process_validation_metrics_skips_structured_extra_info(self):
+        """Structured reward metadata should not be reduced as numeric metrics."""
+        data_sources = ["source1", "source1"]
+        sample_inputs = ["prompt1", "prompt1"]
+        infos_dict = {
+            "score": [0.8, 1.0],
+            "tool_rewards": [{"complete": 0.5}, {"complete": 1.0}],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertAlmostEqual(result["source1"]["score"]["mean@2"], 0.9)
+        self.assertNotIn("tool_rewards", result["source1"])
+
 
 if __name__ == "__main__":
     unittest.main()

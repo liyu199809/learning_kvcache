@@ -36,6 +36,14 @@ logger = logging.getLogger(__name__)
 _NUM_LOCAL_EXPERTS_MODEL_TYPES = {"gpt_oss", "mixtral"}
 
 
+def _is_numeric_scalar(value: Any) -> bool:
+    """Return whether ``value`` can be safely reduced as a scalar metric."""
+    if not np.isscalar(value) or isinstance(value, (str, bytes)):
+        return False
+    dtype = np.asarray(value).dtype
+    return np.issubdtype(dtype, np.number) or np.issubdtype(dtype, np.bool_)
+
+
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
@@ -978,8 +986,9 @@ def process_validation_metrics(
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # Reward extra-info may include structured trace metadata. Only
+                # scalar numeric values are validation metrics that NumPy can reduce.
+                if not var_vals or not all(_is_numeric_scalar(value) for value in var_vals):
                     continue
 
                 # compute mean and std
