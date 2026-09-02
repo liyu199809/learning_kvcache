@@ -1,0 +1,168 @@
+{
+  "output_dir": "/mnt/storage/disk3/self_evolver/traj_data/opsd_mixed_1625_v1",
+  "seed": 42,
+  "train_rows": 4875,
+  "val_rows": 100,
+  "train_rows_by_source": {
+    "deepcoder_taco": 1625,
+    "envscaler_rl": 1625,
+    "awm": 1625
+  },
+  "val_rows_by_source": {
+    "deepcoder_taco": 50,
+    "envscaler_rl": 50
+  },
+  "train_sample_types_by_source": {
+    "awm": {
+      "complete_after_refine": 388,
+      "complete_first_try": 1232,
+      "improved_partial": 5
+    },
+    "envscaler": {
+      "complete_after_refine": 182,
+      "complete_first_try": 434,
+      "improved_partial": 1009
+    },
+    "taco": {
+      "complete_after_refine": 817,
+      "complete_first_try": 774,
+      "improved_partial": 34
+    }
+  },
+  "val_sample_types_by_source": {
+    "envscaler": {
+      "complete_after_refine": 6,
+      "complete_first_try": 13,
+      "improved_partial": 31
+    },
+    "taco": {
+      "complete_after_refine": 25,
+      "complete_first_try": 24,
+      "improved_partial": 1
+    }
+  },
+  "train_quality_tiers_by_source": {
+    "awm": {
+      "A": 999,
+      "B": 626
+    },
+    "envscaler": {
+      "A": 1625
+    },
+    "taco": {
+      "A": 1625
+    }
+  },
+  "filter_stats": {
+    "awm": {
+      "drop:complete_answer_admits_failure": 103,
+      "drop:low_confidence_judge_only_complete": 218,
+      "drop:no_score_improvement": 2710,
+      "drop:target_all_tool_errors": 60,
+      "drop:target_has_no_tool_calls": 2,
+      "input_rows": 10012,
+      "pool:complete_after_refine": 1651,
+      "pool:complete_first_try": 5246,
+      "pool:improved_partial": 22,
+      "pool_tier:A": 4155,
+      "pool_tier:B": 2764,
+      "quality_pool": 6919
+    },
+    "envscaler": {
+      "drop:baseline_verify_error": 7,
+      "drop:duplicate_lower_rank": 85,
+      "drop:duplicate_replaced": 664,
+      "drop:no_score_improvement": 2653,
+      "drop:source_verify_error": 1,
+      "input_rows": 5130,
+      "pool:complete_after_refine": 193,
+      "pool:complete_first_try": 459,
+      "pool:improved_partial": 1068,
+      "pool_tier:A": 1720,
+      "quality_pool": 1720
+    },
+    "taco": {
+      "drop:baseline_verify_error": 1,
+      "drop:no_score_improvement": 2008,
+      "drop:taco_partial_advice_too_long": 5,
+      "drop:taco_reasoning_only_partial": 399,
+      "input_rows": 6379,
+      "pool:complete_after_refine": 1995,
+      "pool:complete_first_try": 1888,
+      "pool:improved_partial": 83,
+      "pool_tier:A": 3966,
+      "quality_pool": 3966
+    }
+  },
+  "token_limits": {
+    "max_prompt_tokens": 28672,
+    "max_response_tokens": 8192,
+    "max_model_tokens": 40960,
+    "privileged_overhead_tokens": 32
+  },
+  "train_token_stats": {
+    "prompt": {
+      "min": 234,
+      "max": 26400,
+      "mean": 6536.787,
+      "p95": 15189
+    },
+    "teacher_prompt": {
+      "min": 36,
+      "max": 12106,
+      "mean": 484.203,
+      "p95": 1255
+    }
+  },
+  "val_token_stats": {
+    "prompt": {
+      "min": 382,
+      "max": 10524,
+      "mean": 3796.08,
+      "p95": 9857
+    },
+    "teacher_prompt": {
+      "min": 136,
+      "max": 2129,
+      "mean": 559.91,
+      "p95": 1173
+    }
+  },
+  "train_val_task_overlap": 0,
+  "source_files": {
+    "awm": [
+      {
+        "path": "/mnt/storage/disk3/self_evolver/traj_data/awm_refine_full.jsonl",
+        "sha256": "7e4efa8bc5572dea9e8b2343e91de4631680933d2d77fbfefd28434ca0ee73de"
+      }
+    ],
+    "envscaler": [
+      {
+        "path": "/mnt/storage/disk3/self_evolver/traj_data/envscaler_refine_full.jsonl",
+        "sha256": "cd8a2b928357b10a8291aa9a8681c5ae28d4349e2bf52c740bbfae2575c89817"
+      },
+      {
+        "path": "/mnt/storage/disk3/self_evolver/traj_data/envscaler_refine_16iter_full.jsonl",
+        "sha256": "52c75dcf35866ada79656bfa5d5a6d95efe07734d4327c167204e0df06b54464"
+      }
+    ],
+    "taco": [
+      {
+        "path": "/mnt/storage/disk3/self_evolver/traj_data/deepcoder_taco_refine_full.jsonl",
+        "sha256": "21620de97e34df025455863f1da0a1b07b7a6fce553dbe16bb0a0d07718f7eb6"
+      }
+    ]
+  },
+  "base_urls": {
+    "awm": "http://localhost:8899",
+    "envscaler": "http://127.0.0.1:8900",
+    "taco": "http://127.0.0.1:8901"
+  },
+  "prompt_tokens": {
+    "min": 234,
+    "max": 26400,
+    "mean": 6536.787,
+    "p95": 15189
+  },
+  "train_contains_all_selected_rows": true
+}

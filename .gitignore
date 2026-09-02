@@ -6,7 +6,7 @@
 *.log
 *.pid
 .claude/
-traj_data
+traj_data/*
 skills
 __pycache__/
 output
@@ -24,3 +24,8 @@ checkpoints
 !verl/**
 !OpenEnv/**
 !benchmark/opd-evolver/**
+
+# 随仓库分发的 OPSD 训练数据集（train/val parquet + manifest）：
+# 已 git add -f 进仓库，解除忽略以便后续直接更新
+!traj_data/opsd_mixed_1625_v1/
+!traj_data/opsd_mixed_1625_v1/**
