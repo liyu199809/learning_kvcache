@@ -78,7 +78,9 @@ class DistillationLossConfig(BaseConfig):
     # Tokens per chunk along (B*T) when ``use_chunked_topk=True``. Larger
     # chunks reduce kernel-launch overhead but increase per-chunk memory;
     # smaller chunks reduce per-chunk memory but increase kernel-launch
-    # overhead (saved-tensor total stays constant either way).
+    # overhead. Saved-tensor total is independent of chunk size (only the
+    # bf16 logits and the [B, T, K] output are kept; per-chunk softmax is
+    # recomputed during backward).
     chunked_topk_chunk_size: int = 4096
 
     use_policy_gradient: bool = True

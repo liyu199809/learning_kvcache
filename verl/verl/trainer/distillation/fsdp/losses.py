@@ -23,6 +23,58 @@ from verl.utils.ulysses import (
 from verl.workers.config import DistillationConfig, DistillationLossConfig
 
 
+class _ChunkedTopKLogProbs(torch.autograd.Function):
+    """Autograd wrapper for the chunked top-k log-prob loop.
+
+    Under plain autograd every fp32 chunk is saved by ``logsumexp``'s backward,
+    so the retained total is N * V * 4 bytes regardless of chunk size and OOMs
+    at long context. This wrapper saves only the bf16 logits (already alive as
+    the engine output) plus the [N, K] result, and recomputes each chunk's
+    softmax during backward at the cost of one extra [chunk, V] fp32 buffer.
+    """
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, topk_ids: torch.Tensor, chunk_size: int) -> torch.Tensor:
+        B, T, V = logits.shape
+        K = topk_ids.shape[-1]
+        flat_logits = logits.reshape(-1, V)  # [N, V]
+        flat_topk = topk_ids.reshape(-1, K)  # [N, K]
+        N = flat_logits.shape[0]
+        out = torch.empty((N, K), dtype=logits.dtype, device=logits.device)
+        for s in range(0, N, chunk_size):
+            e = min(s + chunk_size, N)
+            chunk_logits_fp32 = flat_logits[s:e].float()
+            log_z = torch.logsumexp(chunk_logits_fp32, dim=-1, keepdim=True)  # [c, 1]
+            chunk_topk_logits = torch.gather(chunk_logits_fp32, dim=-1, index=flat_topk[s:e])
+            out[s:e] = (chunk_topk_logits - log_z).to(logits.dtype)
+        ctx.save_for_backward(logits, topk_ids)
+        ctx.chunk_size = chunk_size
+        return out.reshape(B, T, K)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        logits, topk_ids = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        V = logits.shape[-1]
+        K = topk_ids.shape[-1]
+        flat_logits = logits.reshape(-1, V)
+        flat_topk = topk_ids.reshape(-1, K)
+        grad_flat = grad_out.reshape(-1, K)
+        N = flat_logits.shape[0]
+        grad_logits = torch.empty_like(flat_logits)  # [N, V]
+        for s in range(0, N, chunk_size):
+            e = min(s + chunk_size, N)
+            g = grad_flat[s:e].float()  # [c, K]
+            # out = gather(x) - logsumexp(x)  =>  d out / d x = 1[v == topk] - softmax(x)
+            chunk = flat_logits[s:e].float()  # [c, V]
+            log_z = torch.logsumexp(chunk, dim=-1, keepdim=True)  # [c, 1]
+            chunk.sub_(log_z).exp_()  # softmax(x), in place on our fp32 copy
+            chunk.mul_(g.sum(dim=-1, keepdim=True).neg())
+            chunk.scatter_add_(dim=-1, index=flat_topk[s:e], src=g)
+            grad_logits[s:e] = chunk.to(logits.dtype)
+        return grad_logits.view(*logits.shape), None, None
+
+
 def _chunked_topk_log_probs(
     logits: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -33,7 +85,9 @@ def _chunked_topk_log_probs(
     Uses the identity:
         log_softmax(x).gather(idx) == x.gather(idx) - logsumexp(x, keepdim=True)
     Streams the reduction in chunks of `chunk_size` tokens along (B*T) with fp32
-    logsumexp for numerical stability.
+    logsumexp for numerical stability. Wrapped in a custom autograd Function so
+    only the bf16 logits and the [B, T, K] output are saved for backward; the
+    per-chunk softmax is recomputed instead of retaining N * V * 4 fp32 bytes.
 
     Args:
         logits:    [B, T, V] student logits.
@@ -46,21 +100,13 @@ def _chunked_topk_log_probs(
     B, T, V = logits.shape
     K = topk_ids.shape[-1]
     flat_logits = logits.reshape(-1, V)  # [N, V]
-    flat_topk = topk_ids.reshape(-1, K)  # [N, K]
     N = flat_logits.shape[0]
 
     # Edge case: empty input (e.g. fully-padded micro-batch).
     if N == 0:
         return torch.empty((B, T, K), dtype=logits.dtype, device=logits.device)
 
-    out = torch.empty((N, K), dtype=logits.dtype, device=logits.device)
-    for s in range(0, N, chunk_size):
-        e = min(s + chunk_size, N)
-        chunk_logits_fp32 = flat_logits[s:e].float()
-        log_z = torch.logsumexp(chunk_logits_fp32, dim=-1, keepdim=True)  # [c, 1]
-        chunk_topk_logits = torch.gather(chunk_logits_fp32, dim=-1, index=flat_topk[s:e])
-        out[s:e] = (chunk_topk_logits - log_z).to(logits.dtype)
-    return out.reshape(B, T, K)
+    return _ChunkedTopKLogProbs.apply(logits, topk_ids, chunk_size)
 
 
 def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
