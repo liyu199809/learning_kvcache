@@ -10,7 +10,7 @@ Example:
     .venv/bin/python eval_main.py \
         --checkpoint checkpoints/self_evolver_opsd/experiment/global_step_200 \
         --model-name experiment-step200 \
-        --benchmarks bfcl,tau2,lifelong
+        --benchmarks bfcl,tau2,lifelong,coding
 """
 
 from __future__ import annotations
@@ -43,6 +43,10 @@ ALL_BENCHMARKS = (
     "tau2_retail",
     "lifelong_db",
     "lifelong_os",
+    "humaneval_plus",
+    "mbpp_plus",
+    "livecodebench_v5",
+    "livecodebench_v6",
 )
 
 BENCHMARK_ALIASES = {
@@ -55,6 +59,17 @@ BENCHMARK_ALIASES = {
     "lifelong": ("lifelong_db", "lifelong_os"),
     "lifelong_db": ("lifelong_db",),
     "lifelong_os": ("lifelong_os",),
+    "coding": ("humaneval_plus", "mbpp_plus", "livecodebench_v5", "livecodebench_v6"),
+    "humaneval+": ("humaneval_plus",),
+    "humaneval_plus": ("humaneval_plus",),
+    "mbpp+": ("mbpp_plus",),
+    "mbpp_plus": ("mbpp_plus",),
+    "livecodebench": ("livecodebench_v5", "livecodebench_v6"),
+    "lcb": ("livecodebench_v5", "livecodebench_v6"),
+    "lcb_v5": ("livecodebench_v5",),
+    "lcb_v6": ("livecodebench_v6",),
+    "livecodebench_v5": ("livecodebench_v5",),
+    "livecodebench_v6": ("livecodebench_v6",),
 }
 
 
@@ -78,7 +93,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--benchmarks",
         default="all",
-        help="逗号分隔：bfcl,tau2,lifelong；也可指定 tau2_airline 等单项。",
+        help="逗号分隔：bfcl,tau2,lifelong,coding；coding 包含 "
+             "humaneval+ / mbpp+ / LCB v5 / LCB v6。",
     )
     parser.add_argument("--run-name", default=None, help="输出目录名；默认自动生成。")
     parser.add_argument("--port", type=int, default=8000)
@@ -89,6 +105,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bfcl-concurrency", type=int, default=64)
     parser.add_argument("--tau2-concurrency", type=int, default=64)
     parser.add_argument("--lifelong-concurrency", type=int, default=64)
+    parser.add_argument("--coding-concurrency", type=int, default=8)
+    parser.add_argument("--coding-eval-workers", type=int, default=4)
+    parser.add_argument("--coding-n-samples", type=int, default=1)
+    parser.add_argument("--coding-max-completion-tokens", type=int, default=16384)
     parser.add_argument("--tau2-trials", type=int, default=1)
     parser.add_argument("--tau2-max-steps", type=int, default=200)
     parser.add_argument("--max-completion-tokens", type=int, default=4096)
@@ -419,6 +439,42 @@ def benchmark_command(
             "--output-dir",
             str(output_root / "lifelong_os" / "test"),
         ]
+    if benchmark in {"humaneval_plus", "mbpp_plus"}:
+        command[command.index("--llm-max-completion-tokens") + 1] = str(
+            args.coding_max_completion_tokens
+        )
+        public_name = "humaneval+" if benchmark == "humaneval_plus" else "mbpp+"
+        return command + [
+            "--benchmark",
+            public_name,
+            "--concurrency",
+            str(args.coding_concurrency),
+            "--code-eval-workers",
+            str(args.coding_eval_workers),
+            "--code-n-samples",
+            str(args.coding_n_samples),
+            "--output-dir",
+            str(output_root / public_name),
+        ]
+    if benchmark in {"livecodebench_v5", "livecodebench_v6"}:
+        command[command.index("--llm-max-completion-tokens") + 1] = str(
+            args.coding_max_completion_tokens
+        )
+        release = benchmark.removeprefix("livecodebench_")
+        return command + [
+            "--benchmark",
+            "livecodebench",
+            "--lcb-release",
+            release,
+            "--concurrency",
+            str(args.coding_concurrency),
+            "--code-eval-workers",
+            str(args.coding_eval_workers),
+            "--code-n-samples",
+            str(args.coding_n_samples),
+            "--output-dir",
+            str(output_root / "livecodebench" / release),
+        ]
     raise AssertionError(f"未实现 benchmark: {benchmark}")
 
 
@@ -452,6 +508,10 @@ def write_run_config(
         "temperature": args.temperature,
         "top_p": args.top_p,
         "tau2_trials": args.tau2_trials,
+        "coding_n_samples": args.coding_n_samples,
+        "coding_concurrency": args.coding_concurrency,
+        "coding_eval_workers": args.coding_eval_workers,
+        "coding_max_completion_tokens": args.coding_max_completion_tokens,
         "tau2_agent_thinking": False,
         "tau2_user_thinking": False,
     }

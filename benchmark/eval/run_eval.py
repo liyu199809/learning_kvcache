@@ -52,13 +52,14 @@ else:
 
 BFCL_BENCHMARK = "bfcl_v3"
 TAU2_BENCHMARK = "tau2"
+CODE_BENCHMARKS = ("livecodebench", "humaneval+", "mbpp+")
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--benchmark", default="lifelong_db",
                     help=f"要评测的 benchmark。交互式已注册: {', '.join(registry.available())}；"
-                         f"官方管线: {BFCL_BENCHMARK}, {TAU2_BENCHMARK}")
+                         f"官方管线: {BFCL_BENCHMARK}, {TAU2_BENCHMARK}, {', '.join(CODE_BENCHMARKS)}")
     # LLM / vLLM
     ap.add_argument("--openai-base-url", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--model", default="qwen3.5-4b")
@@ -125,11 +126,20 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tau2-judge-thinking", action="store_true",
                     help="启用 judge 思考（默认关闭；Ark 的 budget_tokens "
                          "不生效，disabled 为最低档）。")
+    from benchmark.eval.coding import add_coding_args
+    add_coding_args(ap)
     return ap.parse_args()
 
 
 async def main() -> int:
     args = parse_args()
+
+    if args.benchmark in CODE_BENCHMARKS:
+        from benchmark.eval.coding import run_coding
+        if not args.output_dir:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            args.output_dir = str(Path("workspace") / "eval_logs" / args.benchmark / stamp)
+        return run_coding(args)
 
     # BFCL v3 走官方批处理管线（判分对齐 leaderboard），不进入 EvalRunner 环路。
     if args.benchmark == BFCL_BENCHMARK:

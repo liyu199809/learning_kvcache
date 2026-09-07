@@ -29,6 +29,7 @@
                                       ▼
                       eval_main.py：合并 checkpoint → vLLM → 评测
                       BFCL v3 · tau2-bench · LifelongAgentBench
+                      HumanEval+ · MBPP+ · LiveCodeBench v5/v6
 ```
 
 三个训练数据视图共享同一套 verl 行协议（`messages` + `tools` + `env_config` 路由到对应环境服务）：
@@ -47,7 +48,7 @@
 | `verl/` | verl（RL/蒸馏训练框架）fork，含 `examples/on_policy_distillation_trainer/` 全部训练脚本与自蒸馏/特权上下文支持 |
 | `OpenEnv/` | OpenEnv（统一 RL 环境框架）fork，含 AWM / EnvScaler / CodeJudge 三个环境服务 |
 | `ms-swift/` | ms-swift fork，`swift/rl_core/data.py` 增加了 `teacher_prompt`/teacher-view（OPSD 数据协议） |
-| `benchmark/` | 评测 harness：BFCL v3、tau2-bench、LifelongAgentBench（db/os）适配器与统一入口 |
+| `benchmark/` | 评测 harness：BFCL v3、tau2-bench、LifelongAgentBench（db/os）、HumanEval+、MBPP+、LiveCodeBench v5/v6 适配器与统一入口 |
 | `prefix_tuning/` | Qwen3.5 DeltaNet 虚拟前缀调优（独立研究支线，见其自身 README） |
 | 顶层脚本 | 见下文「快速开始」「服务与常用变量速查」 |
 
@@ -204,7 +205,7 @@ PREFLIGHT_ONLY=1 bash verl/examples/on_policy_distillation_trainer/run_qwen3_5_4
 .venv/bin/python eval_main.py \
     --checkpoint checkpoints/self_evolver_opsd_3way/qwen3_5_4b_opsd_mixed_1625/global_step_100 \
     --model-name mixed-step100 \
-    --benchmarks bfcl,tau2,lifelong
+    --benchmarks bfcl,tau2,lifelong,coding
 ```
 
 | benchmark | 别名 | 前置准备 |
@@ -212,10 +213,13 @@ PREFLIGHT_ONLY=1 bash verl/examples/on_policy_distillation_trainer/run_qwen3_5_4
 | BFCL v3 | `bfcl` | `git clone https://github.com/ShishirPatil/gorilla.git benchmark/gorilla` 后运行 `bash benchmark/bfcl_v3/setup.sh` |
 | tau2-bench | `tau2`（airline + retail） | `bash benchmark/tau2/setup.sh`（自动建独立 Python 3.12 venv，pinned v1.0.1） |
 | LifelongAgentBench | `lifelong`（db + os） | 数据已内置；`lifelong_db` 需本机 Docker（每任务一个 `mysql:8.0` 容器） |
+| EvalPlus | `humaneval+`、`mbpp+` | `bash benchmark/coding/setup.sh`（独立 Python 3.11 venv + 固定依赖） |
+| LiveCodeBench | `lcb_v5`、`lcb_v6`（`lcb` 同时跑二者） | 同上；v5/v6 均按官方累计 release 评测，首次准备会校验固定数据版本 |
+| 代码评测合集 | `coding`（以上四项） | 同上；判题在无网络、非 root、只读 Docker 沙箱中运行 |
 | 全部 | `all` | 以上全部 |
 
 评测期间 root `.env` 里的 `ARK_API_KEY` 用于 tau2 retail 的 NL 裁判。结果输出在 `workspace/eval_logs/`。
-也可以对任意在跑的 vLLM 服务单独评测：`python -m benchmark.eval.run_eval --benchmark lifelong_db --openai-base-url http://127.0.0.1:8000/v1 --model qwen3.5-4b ...`。
+也可以对任意在跑的 vLLM 服务单独评测：`python -m benchmark.eval.run_eval --benchmark humaneval+ --openai-base-url http://127.0.0.1:8000/v1 --model qwen3.5-4b ...`。代码评测的参数与产物说明见 `benchmark/coding/README.md`。
 
 ## 服务与常用变量速查
 
