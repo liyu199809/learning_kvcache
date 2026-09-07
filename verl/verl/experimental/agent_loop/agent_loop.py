@@ -1292,11 +1292,29 @@ class AgentLoopManager:
         if "priority" not in prompts.non_tensor_batch:
             prompts.non_tensor_batch["priority"] = np.arange(len(prompts), dtype=np.int64)
 
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        # Validation may use a larger batch than training to keep the rollout
+        # engines busy.  Let the caller select an exact divisor of that batch
+        # so validation does not generate padded duplicate trajectories.
+        active_worker_count = int(
+            prompts.meta_info.get("agent_loop_active_workers", len(self.agent_loop_workers))
+        )
+        if not 1 <= active_worker_count <= len(self.agent_loop_workers):
+            raise ValueError(
+                f"agent_loop_active_workers={active_worker_count} must be between 1 and "
+                f"{len(self.agent_loop_workers)}"
+            )
+        if len(prompts) % active_worker_count != 0:
+            raise ValueError(
+                f"batch size {len(prompts)} must be divisible by "
+                f"agent_loop_active_workers={active_worker_count}"
+            )
+
+        active_workers = self.agent_loop_workers[:active_worker_count]
+        chunkes = prompts.chunk(active_worker_count)
         outputs = await asyncio.gather(
             *[
                 worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                for worker, chunk in zip(active_workers, chunkes, strict=True)
             ]
         )
         output = DataProto.concat(outputs)

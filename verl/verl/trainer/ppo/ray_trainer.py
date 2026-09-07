@@ -634,8 +634,19 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # pad to be divisible by dp_size
-            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+            # Use the largest available worker count that divides this
+            # validation batch exactly. AgentLoopWorker runs every item in its
+            # chunk concurrently, so this preserves full request concurrency
+            # without generating padded duplicate trajectories. For example,
+            # 100 validation samples use 20 of 24 workers, five tasks each.
+            max_workers = min(
+                self.config.actor_rollout_ref.rollout.agent.num_workers,
+                len(test_gen_batch),
+            )
+            size_divisor = max_workers
+            while len(test_gen_batch) % size_divisor != 0:
+                size_divisor -= 1
+            test_gen_batch.meta_info["agent_loop_active_workers"] = size_divisor
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
