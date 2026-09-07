@@ -34,8 +34,9 @@ VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.85}"
 VLLM_DTYPE="${VLLM_DTYPE:-bfloat16}"
 VLLM_DP="${VLLM_DP:-8}"                        # data-parallel replicas
 VLLM_TP="${VLLM_TP:-1}"                        # tensor-parallel size
+VLLM_EXECUTOR_BACKEND="${VLLM_EXECUTOR_BACKEND:-uni}"  # TP=1: avoid needless worker subprocesses
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-256}"  # per-replica batch concurrency
-VLLM_API_SERVER_COUNT="${VLLM_API_SERVER_COUNT:-1}"  # one frontend balances all DP replicas
+VLLM_API_SERVER_COUNT="${VLLM_API_SERVER_COUNT:-$VLLM_DP}"  # one frontend per local DP replica
 
 AWM_PORT="${AWM_PORT:-8899}"
 AWM_DATA_DIR="${AWM_DATA_DIR:-$PROJECT_ROOT/awm_data}"
@@ -61,6 +62,17 @@ err()   { printf "${c_red}[err ]${c_reset} %s\n" "$*" >&2; }
 is_alive() {
     local pid=$1
     [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+terminate_tree() {
+    # vLLM DP creates API server, engine-core, worker and resource-tracker
+    # descendants. Killing only the immediate child can leave a rendezvous
+    # listener behind and make the next model restart fail with EADDRINUSE.
+    local pid=$1 signal=${2:-TERM} child
+    while read -r child; do
+        [[ -n "$child" ]] && terminate_tree "$child" "$signal"
+    done < <(pgrep -P "$pid" 2>/dev/null || true)
+    kill -"$signal" "$pid" 2>/dev/null || true
 }
 
 port_in_use() {
@@ -110,6 +122,7 @@ parse_services() {
 # vLLM
 # ---------------------------------------------------------------------------
 start_vllm() {
+    mkdir -p "$LOG_DIR"
     if [[ -f "$VLLM_PID_FILE" ]] && is_alive "$(cat "$VLLM_PID_FILE")"; then
         warn "vLLM already running (pid $(cat "$VLLM_PID_FILE")); skipping."
         return 0
@@ -131,6 +144,7 @@ start_vllm() {
             --data-parallel-size $VLLM_DP \
             --api-server-count $VLLM_API_SERVER_COUNT \
             --tensor-parallel-size $VLLM_TP \
+            --distributed-executor-backend $VLLM_EXECUTOR_BACKEND \
             --max-num-seqs $VLLM_MAX_NUM_SEQS \
             --enable-auto-tool-choice \
             --reasoning-parser qwen3 \
@@ -155,16 +169,17 @@ stop_vllm() {
         local pid; pid=$(cat "$VLLM_PID_FILE")
         if is_alive "$pid"; then
             info "Killing vLLM tree (pid $pid)..."
-            pkill -TERM -P "$pid" 2>/dev/null || true
-            kill -TERM "$pid" 2>/dev/null || true
+            terminate_tree "$pid" TERM
             sleep 2
-            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+            kill -0 "$pid" 2>/dev/null && terminate_tree "$pid" KILL || true
             ok "vLLM stopped."
         fi
         rm -f "$VLLM_PID_FILE"
     fi
-    # extra sweep: any lingering vllm serve owned by us
-    pkill -f "vllm serve $MODEL_PATH" 2>/dev/null || true
+    # Extra sweep for this service instance only.  Multiple evaluators may
+    # serve the same model path on different GPUs/ports, so matching only the
+    # model path would terminate peer shards.
+    pkill -f "vllm serve $MODEL_PATH.*--port $VLLM_PORT" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
