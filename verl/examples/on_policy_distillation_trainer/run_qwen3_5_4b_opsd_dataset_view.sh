@@ -20,6 +20,7 @@ shift || true
 
 DATA_ROOT=${DATA_ROOT:-$REPO_ROOT/traj_data/opsd_mixed_1625_v1}
 MODEL=${MODEL:-/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B}
+TEACHER_MODEL=${TEACHER_MODEL:-$MODEL}
 RUN_MODE=${RUN_MODE:-full}
 
 case "$VIEW" in
@@ -97,7 +98,10 @@ else
     TEACHER_GPUS=${TEACHER_GPUS:-2}
     CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
     TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-24}
-    VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-20}
+    # Evaluate the complete 100-row validation set in one request wave. The
+    # agent-loop dispatcher selects an exact worker divisor, so no samples are
+    # padded or regenerated.
+    VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-100}
     TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
     TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-}
     # All four runs share a validation set containing TACO. These settings are
@@ -129,9 +133,20 @@ ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-$REPO_ROOT/rollout_trajs/$RUN_NAME}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-28672}
 ACTOR_LR=${ACTOR_LR:-1e-6}
 DISTILLATION_TOPK=${DISTILLATION_TOPK:-64}
+# TACO can produce 16K-token responses. Keep the mathematically equivalent
+# full-vocabulary logsumexp in small token chunks so its fp32 scratch buffer
+# cannot consume several GiB during the distillation update.
+DISTILLATION_TOPK_CHUNK_SIZE=${DISTILLATION_TOPK_CHUNK_SIZE:-512}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}
+ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-49152}
 
 if [[ ! -f "$MODEL/config.json" ]]; then
     echo "Model checkpoint is missing or invalid: $MODEL" >&2
+    exit 1
+fi
+if [[ ! -f "$TEACHER_MODEL/config.json" ]]; then
+    echo "Teacher model checkpoint is missing or invalid: $TEACHER_MODEL" >&2
     exit 1
 fi
 if [[ ! -f "$TRAIN_FILE" || ! -f "$VAL_FILE" ]]; then
@@ -226,6 +241,7 @@ echo "OPSD view=$VIEW mode=$RUN_MODE train=$TRAIN_ROWS val=$VAL_ROWS"
 echo "thinking=$ENABLE_THINKING turns=$MAX_ASSISTANT_TURNS/$MAX_USER_TURNS repetition_penalty=1.0"
 echo "tokens: prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH model=$MAX_MODEL_LEN"
 echo "actor GPUs=$ACTOR_GPUS teacher GPUs=$TEACHER_GPUS batch=$TRAIN_BATCH_SIZE"
+echo "student model=$MODEL teacher model=$TEACHER_MODEL"
 echo "Log: $LOG_FILE"
 
 if [[ "${PREFLIGHT_ONLY:-0}" == 1 ]]; then
@@ -258,7 +274,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr="$ACTOR_LR" \
-    actor_rollout_ref.actor.ppo_mini_batch_size="$TRAIN_BATCH_SIZE" \
+    actor_rollout_ref.actor.ppo_mini_batch_size="$PPO_MINI_BATCH_SIZE" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$PPO_MAX_TOKEN_LEN_PER_GPU" \
@@ -273,12 +289,13 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization="$GPU_MEMORY_UTILIZATION" \
-    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.enforce_eager="$ROLLOUT_ENFORCE_EAGER" \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.do_sample=True \
     actor_rollout_ref.rollout.temperature=1.0 \
     +actor_rollout_ref.rollout.repetition_penalty=1.0 \
     actor_rollout_ref.rollout.max_model_len="$MAX_MODEL_LEN" \
+    actor_rollout_ref.rollout.max_num_batched_tokens="$MAX_NUM_BATCHED_TOKENS" \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$PPO_MAX_TOKEN_LEN_PER_GPU" \
     actor_rollout_ref.rollout.calculate_log_probs=True \
@@ -315,7 +332,7 @@ python -m verl.trainer.main_ppo \
     distillation.self_distillation=True \
     distillation.n_gpus_per_node="$TEACHER_GPUS" \
     distillation.nnodes=1 \
-    distillation.teacher_models.teacher_model.model_path="$MODEL" \
+    distillation.teacher_models.teacher_model.model_path="$TEACHER_MODEL" \
     distillation.teacher_models.teacher_model.inference.name=vllm \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization="$GPU_MEMORY_UTILIZATION" \
@@ -328,6 +345,7 @@ python -m verl.trainer.main_ppo \
     distillation.distillation_loss.topk="$DISTILLATION_TOPK" \
     distillation.distillation_loss.use_policy_gradient=False \
     +distillation.distillation_loss.use_chunked_topk=True \
+    +distillation.distillation_loss.chunked_topk_chunk_size="$DISTILLATION_TOPK_CHUNK_SIZE" \
     distillation.distillation_loss.use_task_rewards=False \
     distillation.distillation_loss.loss_max_clamp=10.0 \
     distillation.distillation_loss.log_prob_min_clamp=-10.0 \
