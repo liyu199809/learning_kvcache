@@ -31,7 +31,7 @@ def extract_code(text):
 def normalize_solution(text, task, benchmark):
     code = extract_code(text)
     if benchmark != "livecodebench":
-        from evalplus.sanitize import sanitize
+        from sanitize_fast import sanitize
         code = sanitize(code, entrypoint=task["problem"]["entry_point"])
     return code
 
@@ -256,6 +256,7 @@ def main(args):
     manifest["thinking"] = getattr(args, "code_thinking", None)
     for name in ("top_k", "min_p", "presence_penalty", "repetition_penalty", "seed"):
         manifest[name] = getattr(args, "code_" + name, None)
+    manifest["sanitizer"] = "evalplus-0.3.1-equivalent-search-pruning"
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"[coding] {args.benchmark}: {len(tasks)}/{total} tasks, n={args.code_n_samples}", flush=True)
     if args.code_samples:

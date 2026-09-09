@@ -95,6 +95,12 @@ LCB task_id 使用官方 question_id（例如 `abc387_b`）。子集分数明确
 
 ## 验证
 
+`sanitize_fast.py` 保留 EvalPlus 0.3.1 的代码筛选规则，仅剪枝不可能胜出的搜索区间、
+排除追加后续行也无法修复的语法前缀，并消除重复提取，避免长篇复述导致二次复杂度后处理。
+`test_sanitize_fast.py` 与原实现逐字比较提取和清洗结果；`audit_sanitizer.py` 另可对已有
+真实回答做等价性审计。本轮 1594 份原实现产物全部一致，报告保存在评测目录的
+`sanitizer_equivalence_v2.json`。候选代码的官方测试和隔离判题未改动。
+
 ```bash
 cd benchmark/coding
 RUN_CODE_SANDBOX_TESTS=1 .venv/bin/python -m unittest test_coding -v
