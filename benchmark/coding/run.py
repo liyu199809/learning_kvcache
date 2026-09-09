@@ -36,6 +36,28 @@ def normalize_solution(text, task, benchmark):
     return code
 
 
+def sampling_options(args, sample_index=0):
+    """Build explicit API sampling fields without changing historical defaults."""
+    options = {}
+    extra = {}
+    thinking = getattr(args, "code_thinking", None)
+    if thinking is not None:
+        extra["chat_template_kwargs"] = {"enable_thinking": thinking == "on"}
+    for name in ("top_k", "min_p", "repetition_penalty"):
+        value = getattr(args, "code_" + name, None)
+        if value is not None:
+            extra[name] = value
+    presence = getattr(args, "code_presence_penalty", None)
+    if presence is not None:
+        options["presence_penalty"] = presence
+    seed = getattr(args, "code_seed", None)
+    if seed is not None:
+        options["seed"] = seed + sample_index
+    if extra:
+        options["extra_body"] = extra
+    return options
+
+
 async def generate_jobs(jobs, args, path):
     from openai import AsyncOpenAI
 
@@ -48,21 +70,35 @@ async def generate_jobs(jobs, args, path):
                 error = None
                 text = ""
                 finish_reason = None
+                reasoning = None
+                usage = None
                 try:
                     response = await client.chat.completions.create(
                         model=args.model, messages=[{"role": "user", "content": task["prompt"]}],
                         temperature=args.temperature, top_p=args.top_p,
                         max_tokens=args.llm_max_completion_tokens or 16384,
+                        **sampling_options(args, sample_index),
                     )
                     text = response.choices[0].message.content or ""
+                    message = response.choices[0].message
+                    reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
+                    if response.usage is not None:
+                        usage = response.usage.model_dump()
                     finish_reason = response.choices[0].finish_reason
                     if not text.strip():
                         error = "empty_final_answer"
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                 row = {"task_id": task["task_id"], "sample_index": sample_index,
-                       "solution": normalize_solution(text, task, args.benchmark),
-                       "raw_response": text, "finish_reason": finish_reason, "error": error}
+                       "solution": text,
+                       "raw_response": text, "finish_reason": finish_reason, "error": error,
+                       "reasoning_response": reasoning, "usage": usage,
+                       "thinking": getattr(args, "code_thinking", None),
+                       "request_seed": sampling_options(args, sample_index).get("seed")}
+                # Persist the API answer before potentially expensive CPU cleanup.
+                with (path.parent / "raw_samples.jsonl").open("a", encoding="utf-8") as out:
+                    out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                row["solution"] = normalize_solution(text, task, args.benchmark)
                 with path.open("a", encoding="utf-8") as out:
                     out.write(json.dumps(row, ensure_ascii=False) + "\n")
                 return row
@@ -217,6 +253,9 @@ def main(args):
                 "samples_source": args.code_samples,
                 "retry_errors_from": args.code_retry_errors_from,
                 "prompt_mode": "chat_full_solution"}
+    manifest["thinking"] = getattr(args, "code_thinking", None)
+    for name in ("top_k", "min_p", "presence_penalty", "repetition_penalty", "seed"):
+        manifest[name] = getattr(args, "code_" + name, None)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"[coding] {args.benchmark}: {len(tasks)}/{total} tasks, n={args.code_n_samples}", flush=True)
     if args.code_samples:

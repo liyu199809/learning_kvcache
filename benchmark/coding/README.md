@@ -64,6 +64,13 @@ LCB task_id 使用官方 question_id（例如 `abc387_b`）。子集分数明确
 `subset: true`，不将它当作全数据集分数。
 
 默认每题生成 1 个样本，temperature=0、top_p=1，最大 16384 completion tokens。
+`--code-thinking off` 或 `--code-thinking on` 可显式传入 Qwen chat-template 的
+`enable_thinking`，未指定时保持服务端默认行为。评测 manifest 记录该设置；
+逐题样本额外保存 API 返回的 usage 和 reasoning 字段，以便统计输出长度与截断。
+可通过 `--code-top-k`、`--code-min-p`、`--code-presence-penalty`、
+`--code-repetition-penalty` 显式配置采样，未指定时保持原服务默认行为。
+`--code-seed 42` 设置请求随机种子，多样本时使用 `42 + sample_index`。
+这些设置与 thinking 开关独立，并记录在 manifest 中。
 调用 `--code-n-samples 10 --temperature 0.2 --code-pass-k 1,5,10`
 可报告多样本估计 pass@k（只报告 k <= n 的项目）。`--code-timeout 6`
 控制 LCB 单测试超时或 EvalPlus 最小超时，`--code-eval-workers 4` 控制判题并发。
@@ -76,6 +83,7 @@ LCB task_id 使用官方 question_id（例如 `abc387_b`）。子集分数明确
 
 - `manifest.json`：版本/数据 hash、选中 task_id、模型与采样参数。
 - `samples.jsonl`：逐样本完整 solution、原始回答、结束原因及请求错误。
+- `raw_samples.jsonl`：新增生成任务在代码清洗前立即保存的 API 回答，便于区分推理与后处理故障。
 - `results.json`：逐题/逐样本官方判分。
 - `summary.json`：base/plus 或 LCB pass@k，以及请求错误数和子集标识。
 

@@ -14,10 +14,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from data import decode_tests, lcb_prompt, lcb_sample, release_files, select_tasks
-from run import extract_code, generate, prepare_retry_samples, read_samples, score_in_container
+from run import extract_code, generate, prepare_retry_samples, read_samples, score_in_container, sampling_options
 
 
 class CodingTests(unittest.TestCase):
+    def test_sampling_defaults_and_distinct_sample_seeds(self):
+        self.assertEqual(sampling_options(argparse.Namespace()), {})
+        args = argparse.Namespace(code_seed=42)
+        self.assertEqual(sampling_options(args, 0), {"seed": 42})
+        self.assertEqual(sampling_options(args, 1), {"seed": 43})
+
     def test_release_ranges(self):
         self.assertEqual(len(release_files("v5")), 5)
         self.assertEqual(len(release_files("v6")), 6)
@@ -120,8 +126,10 @@ class CodingTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         args = argparse.Namespace(concurrency=2, openai_base_url=f"http://127.0.0.1:{server.server_port}/v1",
-                                  step_timeout=5, model="fixture", temperature=.2, top_p=.9,
-                                  llm_max_completion_tokens=123, benchmark="livecodebench", code_n_samples=2)
+                                  step_timeout=5, model="fixture", temperature=.6, top_p=.95,
+                                  llm_max_completion_tokens=123, benchmark="livecodebench", code_n_samples=2,
+                                  code_thinking="off", code_top_k=20, code_min_p=0.0,
+                                  code_presence_penalty=0.0, code_repetition_penalty=1.0, code_seed=42)
         try:
             with tempfile.TemporaryDirectory() as temp:
                 rows = asyncio.run(generate([{"task_id": "a", "prompt": "question"}], args,
@@ -129,7 +137,25 @@ class CodingTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertTrue(all(r["solution"] == "print(1)" and not r["error"] for r in rows))
             self.assertEqual(requests[0]["max_tokens"], 123)
+            for request in requests:
+                for key, expected in {"temperature": .6, "top_p": .95, "top_k": 20,
+                                      "min_p": 0.0, "presence_penalty": 0.0,
+                                      "repetition_penalty": 1.0}.items():
+                    self.assertEqual(request[key], expected)
+            self.assertEqual({request["seed"] for request in requests}, {42, 43})
+            self.assertEqual(requests[0]["chat_template_kwargs"], {"enable_thinking": False})
+            self.assertEqual(rows[0]["thinking"], "off")
             self.assertEqual(requests[0]["messages"], [{"role": "user", "content": "question"}])
+            for mode, expected in (("on", True), (None, None)):
+                args.code_thinking = mode
+                with tempfile.TemporaryDirectory() as temp:
+                    rows = asyncio.run(generate([{"task_id": "a", "prompt": "question"}], args,
+                                                Path(temp) / "s.jsonl"))
+                if expected is None:
+                    self.assertNotIn("chat_template_kwargs", requests[-1])
+                else:
+                    self.assertEqual(requests[-1]["chat_template_kwargs"], {"enable_thinking": expected})
+                self.assertEqual(rows[0]["thinking"], mode)
         finally:
             server.shutdown()
             server.server_close()

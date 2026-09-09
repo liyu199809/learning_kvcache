@@ -9,6 +9,14 @@ from pathlib import Path
 
 def add_coding_args(parser):
     group = parser.add_argument_group("LiveCodeBench / EvalPlus")
+    group.add_argument("--code-thinking", choices=("on", "off"), default=None,
+                       help="Explicit chat-template thinking mode; omitted preserves server default.")
+    group.add_argument("--code-top-k", type=int, default=None)
+    group.add_argument("--code-min-p", type=float, default=None)
+    group.add_argument("--code-presence-penalty", type=float, default=None)
+    group.add_argument("--code-repetition-penalty", type=float, default=None)
+    group.add_argument("--code-seed", type=int, default=None,
+                       help="Request seed; sample index is added for multi-sample evaluation.")
     group.add_argument("--code-n-samples", type=int, default=1)
     group.add_argument("--code-pass-k", default="1,5,10")
     group.add_argument("--code-eval-workers", type=int, default=4)
