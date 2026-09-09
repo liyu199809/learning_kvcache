@@ -291,6 +291,9 @@ class DistillationConfig(BaseConfig):
     # the chat template, matching the OPSD reference implementation -- required to
     # reproduce the paper's runs token-for-token.
     privileged_mode: str = "append"
+    # append only: independently change the teacher generation opener using the
+    # tokenizer template. None preserves the student's opener (legacy behavior).
+    privileged_append_enable_thinking: Optional[bool] = None
     # chat_turn only: non-tensor batch field with the raw problem statement
     # (dotted). The dataset must carry the untemplated problem text.
     privileged_problem_key: str = "extra_info.problem"
@@ -307,6 +310,8 @@ class DistillationConfig(BaseConfig):
         if self.self_distillation:
             if self.privileged_mode not in ("append", "chat_turn"):
                 raise ValueError(f"privileged_mode must be 'append' or 'chat_turn', got {self.privileged_mode!r}.")
+            if self.privileged_append_enable_thinking is not None and self.privileged_mode != "append":
+                raise ValueError("privileged_append_enable_thinking requires privileged_mode='append'.")
             if self.privileged_mode == "chat_turn":
                 if not self.privileged_problem_key:
                     raise ValueError("privileged_mode='chat_turn' requires a non-empty privileged_problem_key.")

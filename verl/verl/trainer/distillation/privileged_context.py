@@ -74,6 +74,33 @@ def resolve_privileged_solution(sample_kwargs: dict | None, key: str) -> str | N
     return solution or None
 
 
+def build_thinking_prompt_override(
+    tokenizer,
+    student_chat_kwargs: dict | None,
+    teacher_enable_thinking: bool,
+) -> tuple[list[int], list[int]]:
+    """Derive student/teacher assistant openers without retokenizing the real prompt.
+
+    This opt-in path requires a template with an append-only generation prompt.
+    The actual prompt suffix is checked again for every training sample, so an
+    unsupported template cannot silently put the teacher in the wrong mode.
+    """
+    messages = [{"role": "user", "content": "OPSD generation prompt probe"}]
+    student_kwargs = dict(student_chat_kwargs or {})
+    teacher_kwargs = {**student_kwargs, "enable_thinking": teacher_enable_thinking}
+    suffixes = []
+    for kwargs in (student_kwargs, teacher_kwargs):
+        kwargs = {**kwargs, "tokenize": True, "return_dict": False}
+        prefix = list(tokenizer.apply_chat_template(messages, **{**kwargs, "add_generation_prompt": False}))
+        prompt = list(tokenizer.apply_chat_template(messages, **{**kwargs, "add_generation_prompt": True}))
+        if prompt[: len(prefix)] != prefix or len(prompt) <= len(prefix):
+            raise ValueError("Independent teacher thinking requires an append-only, non-empty generation prompt.")
+        suffixes.append(prompt[len(prefix) :])
+    if student_kwargs.get("enable_thinking") != teacher_enable_thinking and suffixes[0] == suffixes[1]:
+        raise ValueError("The chat template does not distinguish the requested student/teacher thinking modes.")
+    return suffixes[0], suffixes[1]
+
+
 def build_privileged_sequence(
     prompt_ids: list[int],
     response_ids: list[int],
@@ -81,6 +108,7 @@ def build_privileged_sequence(
     prefix_ids: list[int],
     suffix_ids: list[int],
     insert_before_token_ids: list[int] | None = None,
+    prompt_suffix_override: tuple[list[int], list[int]] | None = None,
 ) -> list[int]:
     """Build the OPSD teacher's input token sequence.
 
@@ -105,16 +133,26 @@ def build_privileged_sequence(
         suffix_ids: marker tokens placed after the solution. May be empty.
         insert_before_token_ids: if provided and found, insert the solution block
             before the last occurrence of this sub-sequence in ``prompt_ids``.
+        prompt_suffix_override: optional (student opener, teacher opener) token
+            lists. Replace only the validated prompt suffix, leaving every
+            response token unchanged. A missing insertion marker then raises.
 
     Returns:
         The concatenated teacher input token ids.
     """
+    if prompt_suffix_override is not None:
+        source, target = prompt_suffix_override
+        if not source or not target or prompt_ids[-len(source) :] != source:
+            raise ValueError("Student prompt suffix does not match the independently configured thinking mode.")
+        prompt_ids = prompt_ids[: -len(source)] + target
     block = prefix_ids + solution_ids + suffix_ids
     if insert_before_token_ids:
         m = len(insert_before_token_ids)
         for i in range(len(prompt_ids) - m, -1, -1):
             if prompt_ids[i : i + m] == insert_before_token_ids:
                 return prompt_ids[:i] + block + prompt_ids[i:] + response_ids
+        if prompt_suffix_override is not None:
+            raise ValueError("Privileged insertion marker missing after teacher thinking override.")
         # marker not found -> fall through to the default append
     return prompt_ids + block + response_ids
 

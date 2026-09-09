@@ -36,6 +36,14 @@ def test_privileged_mode_defaults_to_append():
     assert c.privileged_mode == "append"
     assert c.privileged_problem_key == "extra_info.problem"
     assert c.privileged_enable_thinking is True
+    assert c.privileged_append_enable_thinking is None
+
+
+def test_append_thinking_override_is_not_silently_ignored_by_chat_turn():
+    import pytest
+
+    with pytest.raises(ValueError, match="privileged_append_enable_thinking"):
+        DistillationConfig(self_distillation=True, privileged_mode="chat_turn", privileged_append_enable_thinking=True)
 
 
 def test_privileged_mode_rejects_unknown_value():

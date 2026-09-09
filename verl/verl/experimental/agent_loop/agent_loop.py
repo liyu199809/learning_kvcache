@@ -53,6 +53,7 @@ from verl.trainer.distillation.privileged_context import (
     REFERENCE_USER_TEMPLATE,
     build_privileged_chat_turn,
     build_privileged_sequence,
+    build_thinking_prompt_override,
     resolve_privileged_solution,
     slice_privileged_teacher_to_student,
 )
@@ -537,6 +538,7 @@ class AgentLoopWorker:
             self._privileged_insert_before_ids: Optional[list[int]] = None
             self._privileged_user_template: str = REFERENCE_USER_TEMPLATE
             self._privileged_chat_kwargs: dict[str, Any] = {}
+            self._privileged_prompt_suffix_override = None
             if self.self_distillation:
                 if self.privileged_mode == "chat_turn":
                     if config.distillation.privileged_user_template:
@@ -545,6 +547,19 @@ class AgentLoopWorker:
                         "enable_thinking": config.distillation.privileged_enable_thinking
                     }
                 else:
+                    teacher_thinking = config.distillation.get("privileged_append_enable_thinking", None)
+                    if teacher_thinking is not None:
+                        self._privileged_prompt_suffix_override = build_thinking_prompt_override(
+                            self.tokenizer,
+                            dict(config.data.get("apply_chat_template_kwargs", {})),
+                            teacher_thinking,
+                        )
+                        source, target = self._privileged_prompt_suffix_override
+                        logger.info(
+                            "OPSD independent thinking: student_opener=%r teacher_opener=%r",
+                            self.tokenizer.decode(source),
+                            self.tokenizer.decode(target),
+                        )
                     self._privileged_prefix_ids = self.tokenizer.encode(
                         config.distillation.privileged_prefix, add_special_tokens=False
                     )
@@ -1085,6 +1100,7 @@ class AgentLoopWorker:
                         self._privileged_prefix_ids,
                         self._privileged_suffix_ids,
                         self._privileged_insert_before_ids,
+                        self._privileged_prompt_suffix_override,
                     )
             else:
                 sequence_ids = prompt_ids + response_ids

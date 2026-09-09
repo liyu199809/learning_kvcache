@@ -20,6 +20,7 @@ import torch
 from verl.trainer.distillation.privileged_context import (
     build_privileged_chat_turn,
     build_privileged_sequence,
+    build_thinking_prompt_override,
     resolve_privileged_solution,
     slice_privileged_teacher_to_student,
 )
@@ -209,3 +210,71 @@ def test_reference_user_template_has_placeholders_and_reference_markers():
     # anchors of the reference implementation's wording
     assert "=== Reference Solution Begin ===" in REFERENCE_USER_TEMPLATE
     assert REFERENCE_USER_TEMPLATE.endswith("\\boxed{}.")
+
+
+class _ThinkingTokenizer:
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
+        assert tokenize and kwargs["return_dict"] is False
+        prefix = [1, 2, 3]
+        if not add_generation_prompt:
+            return prefix
+        return prefix + ([7, 8] if kwargs.get("enable_thinking", True) else [7, 8, 9, 10])
+
+
+def test_thinking_override_derives_opener_and_preserves_original_tokens():
+    kwargs = {"enable_thinking": False}
+    override = build_thinking_prompt_override(_ThinkingTokenizer(), kwargs, True)
+    prompt, response = [1, 2, 3, 7, 8, 9, 10], [20, 21, 22]
+    original = prompt[:]
+    sequence = build_privileged_sequence(prompt, response, [30], [31], [], [3, 7], override)
+    assert override == ([7, 8, 9, 10], [7, 8])
+    assert sequence == [1, 2, 31, 30, 3, 7, 8, 20, 21, 22]
+    assert prompt == original and response == [20, 21, 22]
+    assert kwargs == {"enable_thinking": False}
+    n, k = len(sequence), 2
+    teacher_ids = torch.arange(n * k).reshape(n, k)
+    ids, _ = slice_privileged_teacher_to_student(
+        teacher_ids, teacher_ids.float(), len(prompt), len(response), 0
+    )
+    assert ids.shape == (len(prompt) + len(response), k)
+    for j in range(len(response)):
+        assert torch.equal(ids[len(prompt) - 1 + j], teacher_ids[n - len(response) - 1 + j])
+
+
+def test_thinking_override_supports_reverse_direction():
+    override = build_thinking_prompt_override(_ThinkingTokenizer(), {"enable_thinking": True}, False)
+    assert build_privileged_sequence([1, 2, 3, 7, 8], [20], [30], [], [], [3, 7], override) == [
+        1, 2, 30, 3, 7, 8, 9, 10, 20
+    ]
+
+
+def test_thinking_override_rejects_mismatched_runtime_suffix():
+    with pytest.raises(ValueError, match="Student prompt suffix"):
+        build_privileged_sequence([1, 2, 7, 8], [20], [30], [], [], [2, 7], ([7, 8, 9], [7, 8]))
+
+
+def test_thinking_override_rejects_missing_privileged_insertion_marker():
+    with pytest.raises(ValueError, match="insertion marker missing"):
+        build_privileged_sequence([1, 7, 8, 9], [20], [30], [], [], [99], ([7, 8, 9], [7, 8]))
+
+
+def test_thinking_override_rejects_unsupported_template():
+    class IgnoredThinking(_ThinkingTokenizer):
+        def apply_chat_template(self, *args, **kwargs):
+            kwargs["enable_thinking"] = True
+            return super().apply_chat_template(*args, **kwargs)
+
+    with pytest.raises(ValueError, match="does not distinguish"):
+        build_thinking_prompt_override(IgnoredThinking(), {"enable_thinking": False}, True)
+
+
+def test_thinking_override_rejects_non_append_only_template():
+    class ChangedPrefix(_ThinkingTokenizer):
+        def apply_chat_template(self, *args, **kwargs):
+            result = super().apply_chat_template(*args, **kwargs)
+            if kwargs["add_generation_prompt"]:
+                result[0] = 99
+            return result
+
+    with pytest.raises(ValueError, match="append-only"):
+        build_thinking_prompt_override(ChangedPrefix(), {"enable_thinking": False}, True)

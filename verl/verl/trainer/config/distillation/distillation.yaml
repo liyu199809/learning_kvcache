@@ -131,6 +131,9 @@ privileged_insert_before: ""
 # message from the raw (problem, solution) pair via the chat template, matching the
 # OPSD reference implementation token-for-token.
 privileged_mode: append
+# append only: null inherits the student generation opener; true/false overrides
+# only the teacher opener. The original system/user messages remain unchanged.
+privileged_append_enable_thinking: null
 # chat_turn only: non-tensor batch field with the raw (untemplated) problem text.
 privileged_problem_key: extra_info.problem
 # chat_turn only: teacher user-message template with literal {problem}/{solution}
