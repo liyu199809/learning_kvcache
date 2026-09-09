@@ -95,6 +95,38 @@ LCB task_id 使用官方 question_id（例如 `abc387_b`）。子集分数明确
 
 ## 验证
 
+清洗后的三个 TACO 模型可通过以下入口逐模型评测最后的 step 66（需先用
+`verl.model_merger` 导出到 `workspace/eval_models/cleaned_taco_step66/<训练实验名>/`）：
+
+```bash
+.venv/bin/python benchmark/coding/run_cleaned_taco_suite.py \
+  --thinking off --output-root /absolute/path/to/a-new-evaluation-directory
+```
+
+仅 LCB 的 32K 随机采样对照（thinking 独立指定）：
+
+```bash
+.venv/bin/python benchmark/coding/run_cleaned_taco_suite.py \
+  --lcb-only --thinking off --sampling coding \
+  --max-tokens 32768 --max-model-len 65536 \
+  --output-root /absolute/path/to/a-new-sampling-evaluation-directory
+```
+
+`coding` 参数为 temperature=0.6、top_p=0.95、top_k=20、min_p=0.0、
+presence_penalty=0.0、repetition_penalty=1.0，逐请求 seed=42。每题仍只生成一份回答，
+属于单次随机采样 pass@1，存在采样波动；不要把单次小幅变化视为统计显著。
+选择该参数组不会自动开启 thinking，也不会改变 HumanEval/MBPP 或训练采样默认设置。
+
+此入口使用 DP=8、TP=1，8 张 GPU 共同推理同一个数据集，各数据集推理串行；
+官方隔离容器判分在 CPU 上与后续推理重叠执行。`--thinking training` 沿用各轮
+Student 模式，`--thinking both` 则对每个模型分别测 on/off。输出目录必须全新，
+原始 checkpoint 不修改。权重 SHA-256、服务命令、采样设置保存在 suite manifest
+和 events 中。LCB v6 复用相同的 v5 880 题回答并追加新增 175 题，完整官方判分后
+同时汇报累计 v6 和新增题子集；不把新增题分数当作 v6 全量分数。
+中断后可用 `--resume` 复用已完整判分的模型，启动前会重新校验原始参数和权重
+hash；`--models off_off off_on` 可明确选择剩余模型。已有产物不会覆盖；部分完成且
+没有请求错误的数据集会保留已有样本，在独立 retry 目录仅补齐缺失任务，不按答案质量重采样。
+
 `sanitize_fast.py` 保留 EvalPlus 0.3.1 的代码筛选规则，仅剪枝不可能胜出的搜索区间、
 排除追加后续行也无法修复的语法前缀，并消除重复提取，避免长篇复述导致二次复杂度后处理。
 `test_sanitize_fast.py` 与原实现逐字比较提取和清洗结果；`audit_sanitizer.py` 另可对已有
