@@ -7,11 +7,19 @@ import torch.nn.functional as F
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.models import qwen3_5
-from vllm.model_executor.models.qwen3_5 import (
-    Qwen3_5ForConditionalGeneration,
-    Qwen3_5GatedDeltaNet,
-)
-from vllm.model_executor.models.qwen3_next import fused_gdn_gating
+from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+if hasattr(qwen3_5, "Qwen3_5GatedDeltaNet"):
+    from vllm.model_executor.models.qwen3_5 import Qwen3_5GatedDeltaNet
+    from vllm.model_executor.models.qwen3_next import fused_gdn_gating
+    _GDN_CLASS_NAME = "Qwen3_5GatedDeltaNet"
+else:
+    # vLLM 0.22 shares the GDN implementation between Qwen3.5 and Qwen3Next.
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention as Qwen3_5GatedDeltaNet,
+        fused_gdn_gating,
+    )
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+    _GDN_CLASS_NAME = "QwenGatedDeltaNetAttention"
 from vllm.model_executor.utils import set_weight_attrs
 
 
@@ -20,6 +28,8 @@ class Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if not hasattr(self, "config"):
+            self.config = kwargs.get("config", args[0] if args else None)
         self.num_virtual_tokens = int(
             getattr(self.config, "independent_delta_prefix_num_virtual_tokens", 0)
         )
@@ -105,7 +115,9 @@ class Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
             padding=self.conv_kernel_size - 1,
             groups=conv_input.shape[1],
         )[:, :, : self.num_virtual_tokens]
-        convolved = self.act(convolved).squeeze(0).transpose(0, 1).contiguous()
+        if self.activation not in ("silu", "swish"):
+            raise ValueError(f"Unsupported prefix convolution activation: {self.activation}")
+        convolved = F.silu(convolved).squeeze(0).transpose(0, 1).contiguous()
 
         query, key, value = self.rearrange_mixed_qkv(convolved)
         # fused_gdn_gating returns the same g/beta parameterization as HF:
@@ -163,8 +175,13 @@ class Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
         if bool((new_state_indices < 0).any()):
             raise RuntimeError("Independent Delta prefix received an invalid cache state index")
 
-        self_kv_cache = self.kv_cache[context.virtual_engine]
-        conv_state = self_kv_cache[0].transpose(-1, -2)
+        if _GDN_CLASS_NAME == "QwenGatedDeltaNetAttention":
+            self_kv_cache = self.kv_cache
+            conv_state = (self_kv_cache[0] if is_conv_state_dim_first()
+                          else self_kv_cache[0].transpose(-1, -2))
+        else:
+            self_kv_cache = self.kv_cache[context.virtual_engine]
+            conv_state = self_kv_cache[0].transpose(-1, -2)
         recurrent_state = self_kv_cache[1]
         prefix_conv, prefix_recurrent = self._get_prefix_states(
             conv_state.dtype, recurrent_state.dtype
@@ -186,12 +203,12 @@ class Qwen3_5IndependentDeltaKVPrefixForConditionalGeneration(
     """Native vLLM Qwen3.5 with independent Delta-space prefixes."""
 
     def __init__(self, *, vllm_config, prefix: str = "model"):
-        original_cls = qwen3_5.Qwen3_5GatedDeltaNet
-        qwen3_5.Qwen3_5GatedDeltaNet = Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet
+        original_cls = getattr(qwen3_5, _GDN_CLASS_NAME)
+        setattr(qwen3_5, _GDN_CLASS_NAME, Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet)
         try:
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         finally:
-            qwen3_5.Qwen3_5GatedDeltaNet = original_cls
+            setattr(qwen3_5, _GDN_CLASS_NAME, original_cls)
 
     def invalidate_independent_delta_prefix_caches(self) -> None:
         for module in self.modules():
