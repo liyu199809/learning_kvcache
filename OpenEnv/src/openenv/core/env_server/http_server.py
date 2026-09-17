@@ -46,7 +46,6 @@ from pydantic import ValidationError
 
 from ._utils import overrides_method
 from .interfaces import Environment
-from .mcp_environment import get_server_tools
 from .mcp_types import (
     CallToolAction,
     CallToolObservation,
@@ -61,6 +60,7 @@ from .mcp_types import (
 )
 from .route_config import GetEndpointConfig, register_get_endpoints
 from .serialization import deserialize_action, serialize_observation
+from .tool_utils import get_server_tools
 from .types import (
     Action,
     ConcurrencyConfig,

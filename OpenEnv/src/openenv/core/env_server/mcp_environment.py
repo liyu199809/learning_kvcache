@@ -62,7 +62,6 @@ from fastmcp import Client
 from fastmcp.client.client import CallToolResult
 from mcp.types import TextContent
 
-from ..utils import run_async_safely
 from .interfaces import Environment
 from .mcp_types import (
     CallToolAction,
@@ -75,6 +74,7 @@ from .mcp_types import (
     ToolErrorType,
 )
 from .types import Action, Observation
+from .tool_utils import get_server_tools
 
 
 # Default timeout for MCP tool calls in seconds
@@ -82,25 +82,6 @@ MCP_TOOL_CALL_TIMEOUT = 30.0
 
 # Valid modes for tool registration
 VALID_MODES = {"production", "simulation"}
-
-
-def get_server_tools(mcp_server: Any) -> Dict[str, Any]:
-    """
-    Get tools from a FastMCP server, compatible with both 2.x and 3.x.
-
-    Returns:
-        Dictionary mapping tool names to tool objects.
-    """
-    # FastMCP 2.x: get_tools() returns dict {name: Tool}
-    if hasattr(mcp_server, "get_tools"):
-        result = run_async_safely(mcp_server.get_tools())
-        if isinstance(result, dict):
-            return result
-    # FastMCP 3.x: list_tools() returns list of Tool objects
-    if hasattr(mcp_server, "list_tools"):
-        tools_list = run_async_safely(mcp_server.list_tools())
-        return {t.name: t for t in tools_list}
-    return {}
 
 
 def _tool_from_server_tool(tool: Any) -> Tool:
