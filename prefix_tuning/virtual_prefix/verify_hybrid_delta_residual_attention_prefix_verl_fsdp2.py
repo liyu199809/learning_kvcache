@@ -24,8 +24,9 @@ PREFIX_PATTERN = (
     r".*\.(linear_attn\.(prefix_k|prefix_v|prefix_beta_logits|prefix_a)"
     r"|self_attn\.(prefix_key_tokens|prefix_value_tokens))$"
 )
-EXPECTED_COUNT = 112
-EXPECTED_NUMEL = 315621376
+MODEL_CONFIG = json.loads((Path(MODEL) / "config.json").read_text())
+EXPECTED_COUNT = MODEL_CONFIG["hybrid_prefix"]["trainable_tensor_count"]
+EXPECTED_NUMEL = MODEL_CONFIG["hybrid_prefix"]["trainable_numel"]
 
 
 def _local_tensor(parameter):
@@ -201,9 +202,9 @@ def main() -> None:
         metadata = json.loads((checkpoint_path / "trainable_only_meta.json").read_text())
         if metadata.get("trainable_type") != "hybrid_delta_residual_attention_prefix":
             raise AssertionError(f"Unexpected checkpoint trainable_type: {metadata.get('trainable_type')}")
-        if metadata.get("num_virtual_tokens") != 2048:
+        if metadata.get("num_virtual_tokens") != MODEL_CONFIG["hybrid_prefix"]["delta_prefix_num_virtual_tokens"]:
             raise AssertionError("Checkpoint is missing the Delta prefix length")
-        if metadata.get("attention_num_virtual_tokens") != 256:
+        if metadata.get("attention_num_virtual_tokens") != MODEL_CONFIG["hybrid_prefix"]["attention_prefix_num_virtual_tokens"]:
             raise AssertionError("Checkpoint is missing the attention prefix length")
         if metadata["parameter_names"] != list(engine._trainable_param_order):
             raise AssertionError("Checkpoint parameter order does not match optimizer/model order")
