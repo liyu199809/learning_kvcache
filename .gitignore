@@ -29,3 +29,7 @@ checkpoints
 # 已 git add -f 进仓库，解除忽略以便后续直接更新
 !traj_data/opsd_mixed_1625_v1/
 !traj_data/opsd_mixed_1625_v1/**
+
+# Local crash dumps and macOS copy metadata
+core.*
+._*
