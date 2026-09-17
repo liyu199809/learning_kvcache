@@ -92,6 +92,8 @@ def build_row(
         "env_config": {
             "scenario": str(task["env_id"]),
             "task_idx": int(task_idx),
+            "service": "envscaler",
+            "base_url": base_url.rstrip("/"),
             "awm_base_url": base_url.rstrip("/"),
         },
         "scenario": str(task["env_id"]),

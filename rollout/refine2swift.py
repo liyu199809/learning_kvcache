@@ -298,8 +298,9 @@ def _lenient_json(s: Any) -> Any:
         return json.loads(s)
     except json.JSONDecodeError:
         try:
-            import json_repair
-            return json_repair.loads(s)
+            from rollout.json_compat import loads as loads_json_compat
+
+            return loads_json_compat(s)
         except Exception:
             return {}
 

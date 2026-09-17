@@ -532,6 +532,12 @@ def build_verl_row(
         if target_score is not None and baseline is not None
         else None
     )
+    service = {
+        "awm": "awm",
+        "envscaler": "envscaler",
+        "taco": "codejudge",
+    }[selected.dataset]
+    base_url = base_urls[selected.dataset].rstrip("/")
     extra_info = {
         "problem": str(record.get("task") or ""),
         "task_id": str(task_id),
@@ -558,7 +564,10 @@ def build_verl_row(
         "env_config": {
             "scenario": scenario,
             "task_idx": int(record.get("task_idx")),
-            "awm_base_url": base_urls[selected.dataset].rstrip("/"),
+            "service": service,
+            "base_url": base_url,
+            # Backward compatibility with older training launchers.
+            "awm_base_url": base_url,
         },
         "scenario": scenario,
         "task_idx": int(record.get("task_idx")),

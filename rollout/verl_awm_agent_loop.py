@@ -1,4 +1,4 @@
-"""verl agent loop for Agent World Model environments served by OpenEnv.
+"""verl agent loop for AWM, EnvScaler, and CodeJudge OpenEnv services.
 
 One :class:`AWMAgentLoop` instance is created for each rollout trajectory by
 verl.  The instance therefore owns exactly one OpenEnv WebSocket session.  The
@@ -22,6 +22,23 @@ from verl.tools.function_tool import FunctionTool
 from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 
 logger = logging.getLogger(__name__)
+
+_SERVICE_ALIASES = {
+    "awm": "awm",
+    "agent_world_model": "awm",
+    "envscaler": "envscaler",
+    "env_scaler": "envscaler",
+    "codejudge": "codejudge",
+    "code_judge": "codejudge",
+    "taco": "codejudge",
+    "deepcoder_taco": "codejudge",
+    "deepcoder-taco": "codejudge",
+}
+_SERVICE_DEFAULT_URLS = {
+    "awm": "http://127.0.0.1:8899",
+    "envscaler": "http://127.0.0.1:8900",
+    "codejudge": "http://127.0.0.1:8901",
+}
 
 
 class AWMAgentLoop(ToolAgentLoop):
@@ -112,10 +129,37 @@ class AWMAgentLoop(ToolAgentLoop):
         task_idx = AWMAgentLoop._as_python(config.get("task_idx"))
         if scenario is None or task_idx is None:
             raise ValueError(f"env_config missing scenario/task_idx: {config}")
+
+        base_url = AWMAgentLoop._as_python(
+            config.get("base_url") or config.get("awm_base_url")
+        )
+        raw_service = AWMAgentLoop._as_python(
+            config.get("service") or config.get("env_backend")
+        )
+        if raw_service is None:
+            # Existing parquet files only carry the historical awm_base_url.
+            url = str(base_url or "")
+            if str(scenario) == "taco" or url.endswith(":8901"):
+                service = "codejudge"
+            elif url.endswith(":8900"):
+                service = "envscaler"
+            else:
+                service = "awm"
+        else:
+            service_key = str(raw_service).strip().lower()
+            try:
+                service = _SERVICE_ALIASES[service_key]
+            except KeyError as exc:
+                supported = ", ".join(sorted(_SERVICE_DEFAULT_URLS))
+                raise ValueError(
+                    f"Unsupported OpenEnv service {raw_service!r}; expected one of: {supported}"
+                ) from exc
+
         return {
             "scenario": str(scenario),
             "task_idx": int(task_idx),
-            "awm_base_url": str(config.get("awm_base_url") or "http://localhost:8899").rstrip("/"),
+            "service": service,
+            "base_url": str(base_url or _SERVICE_DEFAULT_URLS[service]).rstrip("/"),
         }
 
     def _create_sync_client(self, base_url: str):
@@ -142,11 +186,11 @@ class AWMAgentLoop(ToolAgentLoop):
         if not self._transport_failed:
             self._transport_error = f"{stage}: {exc}"
         self._transport_failed = True
-        logger.warning("AWM trajectory transport failure: %s", self._transport_error)
+        logger.warning("OpenEnv trajectory transport failure: %s", self._transport_error)
 
     async def _reset_openenv(self, env_config: dict[str, Any]) -> None:
         try:
-            self._env_client = self._create_sync_client(env_config["awm_base_url"])
+            self._env_client = self._create_sync_client(env_config["base_url"])
             result = await asyncio.to_thread(
                 self._env_client.reset,
                 scenario=env_config["scenario"],
@@ -156,7 +200,7 @@ class AWMAgentLoop(ToolAgentLoop):
             if observation.get("error"):
                 raise RuntimeError(observation["error"])
             reward_type = observation.get("reward_type")
-            if reward_type not in (None, "reset_ok"):
+            if reward_type not in (None, "reset_ok", "reset_warning"):
                 raise RuntimeError(f"unexpected reset reward_type={reward_type!r}: {observation}")
             self._reset_succeeded = True
         except Exception as exc:  # OpenEnv exposes several transport exception types.
@@ -314,16 +358,21 @@ class AWMAgentLoop(ToolAgentLoop):
         if self._close_error:
             error = f"{error}; close: {self._close_error}" if error else f"close: {self._close_error}"
         diagnostics = {
+            "env_service": env_config["service"],
+            "env_base_url": env_config["base_url"],
+            "env_scenario": env_config["scenario"],
+            "env_task_idx": env_config["task_idx"],
+            "env_reward": self._verify_reward,
+            "env_reward_type": self._verify_reward_type,
+            "env_verify_result": self._verify_result,
+            "env_error": error,
+            "env_final_answer": self._last_assistant_text,
+            # Historical names remain for downstream AWM dashboards.
             "awm_scenario": env_config["scenario"],
             "awm_task_idx": env_config["task_idx"],
             "awm_reward_type": self._verify_reward_type,
             "awm_error": error,
             "awm_final_answer": self._last_assistant_text,
-            # Generic aliases are preferred by mixed-source training and eval;
-            # retain the awm_* fields above for existing consumers.
-            "env_reward": self._verify_reward,
-            "env_reward_type": self._verify_reward_type,
-            "env_verify_result": self._verify_result,
         }
         output.extra_fields.update(diagnostics)
         output.extra_fields.setdefault("reward_extra_info", {}).update(diagnostics)

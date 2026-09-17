@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 VERL_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 REPO_ROOT=$(cd -- "$VERL_ROOT/.." && pwd)
 
-source "$REPO_ROOT/.venv/bin/activate"
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python)}
 cd "$REPO_ROOT"
 
 VIEW=${1:-${DATASET_VIEW:-}}
@@ -19,7 +19,7 @@ fi
 shift || true
 
 DATA_ROOT=${DATA_ROOT:-$REPO_ROOT/traj_data/opsd_mixed_1625_v1}
-MODEL=${MODEL:-/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B}
+MODEL=${MODEL:-$(dirname "$REPO_ROOT")/models/Qwen3.5-4B}
 TEACHER_MODEL=${TEACHER_MODEL:-$MODEL}
 RUN_MODE=${RUN_MODE:-full}
 
@@ -160,7 +160,7 @@ fi
 
 # Validate the selected data view and discover every OpenEnv endpoint needed by
 # train and validation. This catches stale/misrouted parquet before GPUs start.
-mapfile -t DATA_INFO < <(python - "$TRAIN_FILE" "$VAL_FILE" "$EXPECTED_SOURCE" <<'PY'
+mapfile -t DATA_INFO < <("$PYTHON_BIN" - "$TRAIN_FILE" "$VAL_FILE" "$EXPECTED_SOURCE" <<'PY'
 import sys
 from urllib.parse import urlsplit
 
@@ -182,10 +182,10 @@ print(f"VAL_ROWS={val.num_rows}")
 urls = set()
 for table in (train, val):
     for config in table["env_config"].to_pylist():
-        url = str(config["awm_base_url"]).rstrip("/")
+        url = str(config.get("base_url") or config.get("awm_base_url") or "").rstrip("/")
         parsed = urlsplit(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise SystemExit(f"invalid awm_base_url in parquet: {url!r}")
+            raise SystemExit(f"invalid OpenEnv base URL in parquet: {url!r}")
         urls.add(url)
 for url in sorted(urls):
     print(f"ENV_URL={url}")
@@ -210,8 +210,8 @@ for url in "${ENV_URLS[@]}"; do
 done
 
 if [[ "$RUN_MODE" == full ]]; then
-    if ! python -c 'import wandb' >/dev/null 2>&1; then
-        echo "wandb is not installed in $REPO_ROOT/.venv" >&2
+    if ! "$PYTHON_BIN" -c 'import wandb' >/dev/null 2>&1; then
+        echo "wandb is not installed in the selected base runtime: $PYTHON_BIN" >&2
         exit 1
     fi
     if ! grep -q 'machine api.wandb.ai' "$HOME/.netrc" 2>/dev/null && [[ -z "${WANDB_API_KEY:-}" ]]; then
@@ -254,7 +254,7 @@ if [[ -n "$TOTAL_TRAINING_STEPS" ]]; then
     STEP_OVERRIDE+=(trainer.total_training_steps="$TOTAL_TRAINING_STEPS")
 fi
 
-python -m verl.trainer.main_ppo \
+"$PYTHON_BIN" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     data.train_files="$TRAIN_FILE" \

@@ -69,6 +69,8 @@ def build_row(
         "env_config": {
             "scenario": "taco",
             "task_idx": task_idx,
+            "service": "codejudge",
+            "base_url": base_url.rstrip("/"),
             "awm_base_url": base_url.rstrip("/"),
         },
         "scenario": "taco",

@@ -129,6 +129,8 @@ def build_verl_row(source: dict, awm_base_url: str) -> dict:
     env_config.update(
         scenario=str(source["scenario"]),
         task_idx=int(source["task_idx"]),
+        service="awm",
+        base_url=awm_base_url.rstrip("/"),
         awm_base_url=awm_base_url.rstrip("/"),
     )
     return {

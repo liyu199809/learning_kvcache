@@ -7,10 +7,10 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 VERL_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 REPO_ROOT=$(cd -- "$VERL_ROOT/.." && pwd)
 
-source "$REPO_ROOT/.venv/bin/activate"
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python)}
 cd "$REPO_ROOT"
 
-MODEL=${MODEL:-/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B}
+MODEL=${MODEL:-$(dirname "$REPO_ROOT")/models/Qwen3.5-4B}
 ENVSCALER_BASE_URL=${ENVSCALER_BASE_URL:-http://127.0.0.1:8900}
 DATA_DIR=${DATA_DIR:-$REPO_ROOT/traj_data/envscaler_rl_smoke}
 TASK_ID=${TASK_ID:-env_144_rl-task_37}
@@ -40,7 +40,7 @@ export HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
-python "$SCRIPT_DIR/prepare_envscaler_rl_smoke_data.py" \
+"$PYTHON_BIN" "$SCRIPT_DIR/prepare_envscaler_rl_smoke_data.py" \
     --data-dir "$REPO_ROOT/envscaler_data" \
     --output-dir "$DATA_DIR" \
     --task-id "$TASK_ID" \
@@ -53,7 +53,7 @@ LOG_FILE="$REPO_ROOT/logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
 echo "EnvScaler RL smoke: task=$TASK_ID, rollouts=$ROLLOUT_N, GPUs=$CUDA_VISIBLE_DEVICES"
 echo "Log: $LOG_FILE"
 
-python -m verl.trainer.main_ppo \
+"$PYTHON_BIN" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     data.train_files="$DATA_DIR/train.parquet" \

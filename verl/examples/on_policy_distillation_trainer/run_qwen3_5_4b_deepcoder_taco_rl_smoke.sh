@@ -7,10 +7,10 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 VERL_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 REPO_ROOT=$(cd -- "$VERL_ROOT/.." && pwd)
 
-source "$REPO_ROOT/.venv/bin/activate"
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python)}
 cd "$REPO_ROOT"
 
-MODEL=${MODEL:-/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B}
+MODEL=${MODEL:-$(dirname "$REPO_ROOT")/models/Qwen3.5-4B}
 CODE_JUDGE_BASE_URL=${CODE_JUDGE_BASE_URL:-http://127.0.0.1:8901}
 DATA_DIR=${DATA_DIR:-$REPO_ROOT/traj_data/deepcoder_taco_smoke}
 TASK_IDX=${TASK_IDX:-2}
@@ -40,7 +40,7 @@ export HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
-python "$SCRIPT_DIR/prepare_deepcoder_taco_rl_data.py" \
+"$PYTHON_BIN" "$SCRIPT_DIR/prepare_deepcoder_taco_rl_data.py" \
     --data-dir "$REPO_ROOT/data/deepcoder_taco/177913a7bd43791646ef6a43645caa3c871ab3db" \
     --output-dir "$DATA_DIR" \
     --task-indices "$TASK_IDX" \
@@ -53,7 +53,7 @@ LOG_FILE="$REPO_ROOT/logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
 echo "DeepCoder TACO RL smoke: task_idx=$TASK_IDX, rollouts=$ROLLOUT_N, GPUs=$CUDA_VISIBLE_DEVICES"
 echo "Log: $LOG_FILE"
 
-python -m verl.trainer.main_ppo \
+"$PYTHON_BIN" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     data.train_files="$DATA_DIR/train.parquet" \

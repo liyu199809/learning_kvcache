@@ -24,8 +24,9 @@ import time
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Iterable, NamedTuple, Protocol
 
-import json_repair
 from openai import AsyncOpenAI
+
+from rollout.json_compat import loads as loads_json_compat
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +526,7 @@ def loads_lenient(text: str) -> Any:
         return json.loads(s)
     except json.JSONDecodeError:
         try:
-            return json_repair.loads(s)
+            return loads_json_compat(s)
         except Exception:
             return None
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start / stop / check the two backend services for AWM eval:
+# Start / stop / check the vLLM and AWM backend services:
 #   1) vLLM OpenAI-compatible server (Qwen3.5-4B) on :$VLLM_PORT
 #   2) AWM environment server (FastAPI + MCP) on :$AWM_PORT
 #
@@ -20,11 +20,13 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Config (override via env vars)
 # ---------------------------------------------------------------------------
-PROJECT_ROOT="${PROJECT_ROOT:-/mnt/storage/disk3/self_evolver}"
-VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT="${PROJECT_ROOT:-$SCRIPT_DIR}"
 OPENENV_ROOT="${OPENENV_ROOT:-$PROJECT_ROOT/OpenEnv}"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
+VLLM_BIN="${VLLM_BIN:-$(command -v vllm)}"
 
-MODEL_PATH="${MODEL_PATH:-/mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B}" # /mnt/storage/disk1/verl_data/base_model/Qwen3.5-4B
+MODEL_PATH="${MODEL_PATH:-$(dirname "$PROJECT_ROOT")/models/Qwen3.5-4B}"
 MODEL_NAME="${MODEL_NAME:-qwen3.5-4b}"
 
 VLLM_PORT="${VLLM_PORT:-8000}"
@@ -133,23 +135,21 @@ start_vllm() {
     fi
 
     info "Starting vLLM on GPU=$VLLM_GPU DP=$VLLM_DP TP=$VLLM_TP port=$VLLM_PORT model=$MODEL_PATH"
-    nohup bash -c "
-        source '$VENV_PATH/bin/activate' && \
-        CUDA_VISIBLE_DEVICES=$VLLM_GPU vllm serve '$MODEL_PATH' \
-            --served-model-name '$MODEL_NAME' \
-            --host 0.0.0.0 --port $VLLM_PORT \
-            --max-model-len $VLLM_MAX_LEN \
-            --gpu-memory-utilization $VLLM_GPU_UTIL \
-            --dtype $VLLM_DTYPE \
-            --data-parallel-size $VLLM_DP \
-            --api-server-count $VLLM_API_SERVER_COUNT \
-            --tensor-parallel-size $VLLM_TP \
-            --distributed-executor-backend $VLLM_EXECUTOR_BACKEND \
-            --max-num-seqs $VLLM_MAX_NUM_SEQS \
+    nohup env CUDA_VISIBLE_DEVICES="$VLLM_GPU" "$VLLM_BIN" serve "$MODEL_PATH" \
+            --served-model-name "$MODEL_NAME" \
+            --host 0.0.0.0 --port "$VLLM_PORT" \
+            --max-model-len "$VLLM_MAX_LEN" \
+            --gpu-memory-utilization "$VLLM_GPU_UTIL" \
+            --dtype "$VLLM_DTYPE" \
+            --data-parallel-size "$VLLM_DP" \
+            --api-server-count "$VLLM_API_SERVER_COUNT" \
+            --tensor-parallel-size "$VLLM_TP" \
+            --distributed-executor-backend "$VLLM_EXECUTOR_BACKEND" \
+            --max-num-seqs "$VLLM_MAX_NUM_SEQS" \
             --enable-auto-tool-choice \
             --reasoning-parser qwen3 \
-            --tool-call-parser qwen3_coder 
-    " >"$VLLM_LOG" 2>&1 </dev/null &
+            --tool-call-parser qwen3_coder \
+        >"$VLLM_LOG" 2>&1 </dev/null &
     local pid=$!
     disown "$pid" 2>/dev/null || true
     echo "$pid" > "$VLLM_PID_FILE"
@@ -196,14 +196,14 @@ start_awm() {
     fi
 
     info "Starting AWM env server on port $AWM_PORT, data=$AWM_DATA_DIR"
-    nohup bash -c "
-        source '$VENV_PATH/bin/activate' && \
-        cd '$OPENENV_ROOT' && \
-        AWM_DATA_DIR='$AWM_DATA_DIR' PYTHONPATH=src:envs \
-            '$VENV_PATH/bin/uvicorn' envs.agent_world_model_env.server.app:app \
-                --host 0.0.0.0 --port $AWM_PORT \
+    (
+        cd "$OPENENV_ROOT"
+        exec env AWM_DATA_DIR="$AWM_DATA_DIR" \
+            PYTHONPATH="$OPENENV_ROOT/src:$OPENENV_ROOT/envs:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+            "$PYTHON_BIN" -m uvicorn envs.agent_world_model_env.server.app:app \
+                --host 0.0.0.0 --port "$AWM_PORT" \
                 --ws-ping-interval 20 --ws-ping-timeout 300
-    " >"$AWM_LOG" 2>&1 </dev/null &
+    ) >"$AWM_LOG" 2>&1 </dev/null &
     local pid=$!
     disown "$pid" 2>/dev/null || true
     echo "$pid" > "$AWM_PID_FILE"
@@ -282,8 +282,8 @@ case "$cmd" in
         status
         echo
         ok "All services up. To run smoke eval:"
-        echo "    cd $OPENENV_ROOT && source $VENV_PATH/bin/activate && \\"
-        echo "    PYTHONPATH=src:envs python examples/agent_world_model/awm_smoke_eval.py \\"
+        echo "    cd $OPENENV_ROOT && \\"
+        echo "    PYTHONPATH=src:envs $PYTHON_BIN examples/agent_world_model/awm_smoke_eval.py \\"
         echo "        --num-scenarios 3 --tasks-per-scenario 1"
         echo
         echo "For 8-GPU DP throughput mode, restart with:"
@@ -330,7 +330,7 @@ Environment overrides:
   MODEL_PATH, MODEL_NAME, VLLM_PORT, VLLM_GPU, VLLM_MAX_LEN,
   VLLM_GPU_UTIL, VLLM_DTYPE, VLLM_DP, VLLM_TP, VLLM_MAX_NUM_SEQS,
   AWM_PORT, AWM_DATA_DIR,
-  PROJECT_ROOT, VENV_PATH, OPENENV_ROOT, LOG_DIR,
+  PROJECT_ROOT, OPENENV_ROOT, PYTHON_BIN, VLLM_BIN, LOG_DIR,
   VLLM_READY_TIMEOUT, AWM_READY_TIMEOUT
 EOF
         exit 2

@@ -3,9 +3,10 @@
 
 set -euo pipefail
 
-PROJECT_ROOT=${PROJECT_ROOT:-/mnt/storage/disk3/self_evolver}
-VENV_PATH=${VENV_PATH:-$PROJECT_ROOT/.venv}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=${PROJECT_ROOT:-$SCRIPT_DIR}
 OPENENV_ROOT=${OPENENV_ROOT:-$PROJECT_ROOT/OpenEnv}
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python)}
 ENVSCALER_PORT=${ENVSCALER_PORT:-8900}
 ENVSCALER_DATA_DIR=${ENVSCALER_DATA_DIR:-$PROJECT_ROOT/envscaler_data}
 ENVSCALER_LOG=${ENVSCALER_LOG:-/tmp/envscaler_openenv.log}
@@ -65,13 +66,14 @@ start_service() {
         echo "EnvScaler data directory does not exist: $ENVSCALER_DATA_DIR" >&2
         return 1
     fi
-    nohup bash -c "
-        cd '$OPENENV_ROOT' &&
-        exec env ENVSCALER_DATA_DIR='$ENVSCALER_DATA_DIR' PYTHONPATH=src:envs \
-            '$VENV_PATH/bin/uvicorn' envs.env_scaler_env.server.app:app \
-                --host 0.0.0.0 --port '$ENVSCALER_PORT' \
+    (
+        cd "$OPENENV_ROOT"
+        exec env ENVSCALER_DATA_DIR="$ENVSCALER_DATA_DIR" \
+            PYTHONPATH="$OPENENV_ROOT/src:$OPENENV_ROOT/envs:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+            "$PYTHON_BIN" -m uvicorn envs.env_scaler_env.server.app:app \
+                --host 0.0.0.0 --port "$ENVSCALER_PORT" \
                 --ws-ping-interval 20 --ws-ping-timeout 300
-    " >"$ENVSCALER_LOG" 2>&1 </dev/null &
+    ) >"$ENVSCALER_LOG" 2>&1 </dev/null &
     local pid=$!
     echo "$pid" >"$ENVSCALER_PID_FILE"
     if wait_ready; then
