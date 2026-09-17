@@ -29,6 +29,9 @@ def add_coding_args(parser):
         help="Reuse successful rows from an existing samples JSONL and regenerate only missing/error rows.",
     )
     group.add_argument("--code-generate-only", action="store_true")
+    group.add_argument("--code-execution-backend", choices=("docker", "nsjail"),
+                       default=os.environ.get("CODE_EXECUTION_BACKEND", "docker"),
+                       help="Official scorer execution sandbox; nsjail needs no Docker/cgroup writes.")
     group.add_argument("--code-docker-image", default="ubuntu:latest")
     group.add_argument("--code-memory", default="8g")
     group.add_argument("--lcb-release", choices=("v5", "v6"), default="v6",

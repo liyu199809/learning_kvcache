@@ -5,6 +5,8 @@ Uses cached EvalPlus data and the pinned cumulative LCB v5/v6 files, downloading
 """
 import argparse
 import json
+import os
+import sys
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,7 +17,16 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def main():
-    output = Path(tempfile.mkdtemp(prefix="coding-real-smoke-", dir=ROOT / "benchmark/coding/data"))
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output-dir', type=Path)
+    parser.add_argument('--execution-backend', choices=['docker', 'nsjail'],
+                        default=os.environ.get('CODE_EXECUTION_BACKEND', 'docker'))
+    options = parser.parse_args()
+    if options.output_dir:
+        output = options.output_dir.resolve()
+        output.mkdir(parents=True, exist_ok=False)
+    else:
+        output = Path(tempfile.mkdtemp(prefix="coding-real-smoke-", dir=ROOT / "benchmark/coding/data"))
     cases = (
         ("humaneval+", None, None),
         ("mbpp+", None, None),
@@ -42,10 +53,12 @@ def main():
                                    for code in (solution, "raise RuntimeError('intentionally wrong')")))
         destination = output / label
         subprocess.run([
-            str(ROOT / ".venv/bin/python"), "-m", "benchmark.eval.run_eval", "--benchmark", benchmark,
+            os.getenv("PROJECT_PYTHON", sys.executable), "-m", "benchmark.eval.run_eval", "--benchmark", benchmark,
             "--lcb-release", release or "v6", "--task-ids", task["task_id"], "--code-n-samples", "2",
             "--code-pass-k", "1,2", "--code-samples", str(samples), "--output-dir", str(destination),
             "--code-timeout", "2", "--code-eval-workers", "2",
+            "--code-execution-backend", options.execution_backend,
+            "--code-eval-timeout", "300", "--code-memory", "4g",
         ], cwd=ROOT, check=True)
         summary = json.loads((destination / "summary.json").read_text())
         metrics = summary["metrics"]

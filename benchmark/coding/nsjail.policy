@@ -1,0 +1,17 @@
+// Keep normal Python/numpy/multiprocessing syscalls available. Deny changes to
+// namespaces/mounts/privilege, cross-process inspection and non-Unix sockets.
+ERRNO(1) {
+    mount, umount, pivot_root, chroot, setns, unshare,
+    fsopen, fsconfig, fsmount, fspick, open_tree, move_mount, mount_setattr,
+    ptrace, process_vm_readv, process_vm_writev, bpf, perf_event_open,
+    keyctl, add_key, request_key, kexec_load, reboot,
+    init_module, finit_module, delete_module, swapon, swapoff,
+    open_by_handle_at, name_to_handle_at, userfaultfd,
+    io_uring_setup, io_uring_enter, io_uring_register,
+    setuid, setgid, setreuid, setregid, setresuid, setresgid, setgroups,
+    socket { family != 1 },
+    clone { (clone_flags & 0x7e020000) != 0 }
+}
+// Return ENOSYS so libc can use the ordinary clone syscall for threads/forks.
+ERRNO(38) { clone3 }
+DEFAULT ALLOW

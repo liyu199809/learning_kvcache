@@ -59,12 +59,18 @@ def sampling_options(args, sample_index=0):
 
 
 async def generate_jobs(jobs, args, path):
+    import httpx
     from openai import AsyncOpenAI
 
     semaphore = asyncio.Semaphore(args.concurrency)
+    http_limits = httpx.Limits(
+        max_connections=max(32, args.concurrency * 2),
+        max_keepalive_connections=max(16, args.concurrency),
+    )
     async with AsyncOpenAI(base_url=args.openai_base_url,
                            api_key=os.environ.get("CODE_EVAL_API_KEY", "EMPTY"),
-                           timeout=args.step_timeout, max_retries=2) as client:
+                           timeout=args.step_timeout, max_retries=2,
+                           http_client=httpx.AsyncClient(limits=http_limits)) as client:
         async def one(task, sample_index):
             async with semaphore:
                 error = None
@@ -238,8 +244,13 @@ def main(args):
         if (output / name).exists():
             raise ValueError(f"Output already contains {name}; choose a fresh --output-dir")
     if not args.code_generate_only:
-        subprocess.run(["docker", "image", "inspect", args.code_docker_image], check=True,
-                       stdout=subprocess.DEVNULL)
+        if getattr(args, "code_execution_backend", "docker") == "nsjail":
+            from nsjail_backend import check_runtime, memory_mib
+            check_runtime()
+            memory_mib(args.code_memory)
+        else:
+            subprocess.run(["docker", "image", "inspect", args.code_docker_image], check=True,
+                           stdout=subprocess.DEVNULL)
     tasks, provenance = load_tasks(args)
     total = len(tasks)
     tasks = select_tasks(tasks, args)
@@ -257,6 +268,12 @@ def main(args):
     for name in ("top_k", "min_p", "presence_penalty", "repetition_penalty", "seed"):
         manifest[name] = getattr(args, "code_" + name, None)
     manifest["sanitizer"] = "evalplus-0.3.1-equivalent-search-pruning"
+    backend = getattr(args, "code_execution_backend", "docker")
+    if not args.code_generate_only and backend == "nsjail":
+        from nsjail_backend import provenance as sandbox_provenance
+        manifest["execution"] = sandbox_provenance()
+    else:
+        manifest["execution"] = {"backend": None if args.code_generate_only else backend}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"[coding] {args.benchmark}: {len(tasks)}/{total} tasks, n={args.code_n_samples}", flush=True)
     if args.code_samples:
@@ -288,7 +305,11 @@ def main(args):
            "task_ids": list(grouped), "problems": problems, "solutions": list(grouped.values()),
            "k": k, "workers": args.code_eval_workers, "timeout": args.code_timeout,
            "base_only": False}
-    results = score_in_container(job, args)
+    if backend == "nsjail":
+        from nsjail_backend import score_in_nsjail
+        results = score_in_nsjail(job, args)
+    else:
+        results = score_in_container(job, args)
     (output / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     summary = {"benchmark": args.benchmark, "model": args.model, "tasks": len(tasks),
                "samples": len(rows), "generation_errors": errors, "metrics": results["metrics"],
