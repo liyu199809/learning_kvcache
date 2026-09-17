@@ -209,7 +209,7 @@ async def main() -> int:
     print(f"pass@1:       {(successes / total * 100) if total else 0:.1f}%")
     print(f"Output:       {output_dir}")
     print("=" * 72)
-    return 0
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

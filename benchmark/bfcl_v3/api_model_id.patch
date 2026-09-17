@@ -1,0 +1,20 @@
+--- a/bfcl_eval/model_handler/local_inference/base_oss_handler.py
++++ b/bfcl_eval/model_handler/local_inference/base_oss_handler.py
+@@ -343,7 +343,7 @@
+         start_time = time.time()
+         if len(extra_body) > 0:
+             api_response = self.client.completions.create(
+-                model=self.model_path_or_id,
++                model=os.getenv("BFCL_API_MODEL_ID", self.model_path_or_id),
+                 temperature=self.temperature,
+                 prompt=formatted_prompt,
+                 max_tokens=leftover_tokens_count,
+@@ -352,7 +352,7 @@
+             )
+         else:
+             api_response = self.client.completions.create(
+-                model=self.model_path_or_id,
++                model=os.getenv("BFCL_API_MODEL_ID", self.model_path_or_id),
+                 temperature=self.temperature,
+                 prompt=formatted_prompt,
+                 max_tokens=leftover_tokens_count,

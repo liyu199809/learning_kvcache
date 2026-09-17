@@ -5,34 +5,26 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 GORILLA_REPO="${GORILLA_REPO:-$PROJECT_ROOT/benchmark/gorilla}"
 OFFICIAL_ROOT="${BFCL_OFFICIAL_ROOT:-$SCRIPT_DIR/official}"
-PROJECT_PYTHON="${PROJECT_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
+PROJECT_PYTHON="${PROJECT_PYTHON:-$PROJECT_ROOT/benchmark/.venv/bin/python}"
 BFCL_COMMIT="cd9429ccf3d4d04156affe883c495b3b047e6b64"
 MARKER="$OFFICIAL_ROOT/.bfcl_commit"
 
-if [[ ! -d "$GORILLA_REPO/.git" ]]; then
-    echo "Missing Gorilla checkout: $GORILLA_REPO" >&2
-    echo "Clone https://github.com/ShishirPatil/gorilla.git there or set GORILLA_REPO." >&2
-    exit 1
-fi
-
-if ! git -C "$GORILLA_REPO" cat-file -e "$BFCL_COMMIT^{commit}" 2>/dev/null; then
-    echo "Fetching official BFCL v3 commit..."
-    git -C "$GORILLA_REPO" fetch origin "$BFCL_COMMIT"
-fi
-
 installed_commit=""
-if [[ -f "$MARKER" ]]; then
-    installed_commit="$(<"$MARKER")"
-fi
-
+[[ ! -f "$MARKER" ]] || installed_commit=$(cat "$MARKER")
 if [[ "$installed_commit" != "$BFCL_COMMIT" ]]; then
-    rm -rf "$OFFICIAL_ROOT"
+    if [[ -d "$OFFICIAL_ROOT" && -n "$(ls -A "$OFFICIAL_ROOT")" ]]; then
+        echo "Refusing to overwrite unverified BFCL source: $OFFICIAL_ROOT" >&2; exit 1
+    fi
     mkdir -p "$OFFICIAL_ROOT"
-    git -C "$GORILLA_REPO" archive \
-        "$BFCL_COMMIT" \
-        berkeley-function-call-leaderboard \
-        | tar -x -C "$OFFICIAL_ROOT" --strip-components=1
-    printf '%s\n' "$BFCL_COMMIT" >"$MARKER"
+    if [[ -d "$GORILLA_REPO/.git" ]]; then
+        git -C "$GORILLA_REPO" cat-file -e "$BFCL_COMMIT^{commit}" 2>/dev/null || git -C "$GORILLA_REPO" fetch origin "$BFCL_COMMIT"
+        git -C "$GORILLA_REPO" archive "$BFCL_COMMIT" berkeley-function-call-leaderboard |
+            tar -x -C "$OFFICIAL_ROOT" --strip-components=1
+    else
+        curl --fail --location --retry 3 "https://codeload.github.com/ShishirPatil/gorilla/tar.gz/$BFCL_COMMIT" |
+            tar -xz --strip-components=2 -C "$OFFICIAL_ROOT" "gorilla-$BFCL_COMMIT/berkeley-function-call-leaderboard"
+    fi
+    printf '%s\n' "$BFCL_COMMIT" > "$MARKER"
 fi
 
 # Local patch: let the OSS handler send BFCL_API_MODEL_ID as the API model id
@@ -78,7 +70,7 @@ for module, requirement in requirements.items():
 PY
 )
 if (( ${#MISSING_SPECS[@]} )); then
-    uv pip install --python "$PROJECT_PYTHON" --no-deps "${MISSING_SPECS[@]}"
+    uv pip install --python "$PROJECT_PYTHON" "${MISSING_SPECS[@]}"
 fi
 
 BFCL_PROJECT_ROOT="$SCRIPT_DIR/artifacts" \
@@ -103,4 +95,4 @@ PYTHONPATH="$OFFICIAL_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
 "$PROJECT_PYTHON" -m bfcl_eval test-categories >/dev/null
 
 echo "Official commit: $BFCL_COMMIT"
-echo "Environment:     $PROJECT_ROOT/.venv"
+echo "Environment:     $PROJECT_PYTHON"

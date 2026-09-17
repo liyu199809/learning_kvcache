@@ -128,7 +128,7 @@ def run_tau2(args) -> int:
     Path(save_to).mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        str(tau2_bin), "run",
+        str(venv_dir / "bin" / "python"), str(tau2_root / "launch.py"), "run",
         "--domain", args.tau2_domain,
         "--agent-llm", llm_model,
         "--agent-llm-args", agent_llm_args_json,
@@ -229,4 +229,18 @@ def run_tau2(args) -> int:
     if results_json.exists():
         print(f"\n[tau2] 结果与 pass^k 指标见: {results_json}")
         print(f"[tau2] 浏览: {tau2_bin} view --dir {save_to}")
-    return proc.returncode
+    if proc.returncode:
+        return proc.returncode
+    if not results_json.exists():
+        print("[tau2] Missing results.json")
+        return 1
+    saved = json.loads(results_json.read_text())
+    simulations = saved.get("simulations", [])
+    expected = len(saved.get("tasks", [])) * args.tau2_num_trials
+    infrastructure_errors = [s for s in simulations
+                             if s.get("termination_reason") == "infrastructure_error"]
+    if not expected or len(simulations) != expected or infrastructure_errors:
+        print(f"[tau2] Incomplete run: expected={expected}, saved={len(simulations)}, "
+              f"infrastructure_errors={len(infrastructure_errors)}")
+        return 1
+    return 0

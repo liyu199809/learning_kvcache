@@ -17,15 +17,22 @@ REPO_URL="https://github.com/sierra-research/tau2-bench"
 
 command -v uv >/dev/null 2>&1 || { echo "uv 不在 PATH 中，请先安装 uv。" >&2; exit 1; }
 
-# 1) 官方源码：克隆并固定到 pinned commit。
-if [[ ! -d "$OFFICIAL_ROOT/.git" ]]; then
-    echo "Cloning tau2-bench official source..."
-    git clone --quiet "$REPO_URL" "$OFFICIAL_ROOT"
+# 1) Pinned source; codeload archive also works when GitHub git transport is blocked.
+SOURCE_MARKER="$OFFICIAL_ROOT/.source_commit"
+if [[ -d "$OFFICIAL_ROOT/.git" ]]; then
+    git -C "$OFFICIAL_ROOT" cat-file -e "$TAU2_COMMIT^{commit}" 2>/dev/null || git -C "$OFFICIAL_ROOT" fetch origin "$TAU2_COMMIT"
+    git -C "$OFFICIAL_ROOT" checkout --quiet "$TAU2_COMMIT"
+elif [[ -f "$SOURCE_MARKER" && "$(cat "$SOURCE_MARKER")" == "$TAU2_COMMIT" ]]; then
+    test -f "$OFFICIAL_ROOT/src/tau2/cli.py"
+else
+    if [[ -d "$OFFICIAL_ROOT" && -n "$(ls -A "$OFFICIAL_ROOT")" ]]; then
+        echo "Refusing to overwrite unverified tau2 source: $OFFICIAL_ROOT" >&2; exit 1
+    fi
+    mkdir -p "$OFFICIAL_ROOT"
+    curl --fail --location --retry 3 "https://codeload.github.com/sierra-research/tau2-bench/tar.gz/$TAU2_COMMIT" |
+        tar -xz --strip-components=1 -C "$OFFICIAL_ROOT"
 fi
-if ! git -C "$OFFICIAL_ROOT" cat-file -e "$TAU2_COMMIT^{commit}" 2>/dev/null; then
-    git -C "$OFFICIAL_ROOT" fetch --quiet origin "$TAU2_COMMIT"
-fi
-git -C "$OFFICIAL_ROOT" checkout --quiet "$TAU2_COMMIT"
+printf '%s\n' "$TAU2_COMMIT" > "$SOURCE_MARKER"
 
 # 2) 专用 uv venv（Python 3.12），与主环境隔离。
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then

@@ -1,0 +1,19 @@
+{
+  "dataset": "csyq/LifelongAgentBench",
+  "revision": "75054b60177d4dcddb93b984413ff799b0a1fdbc",
+  "source_split": "train",
+  "evaluation_alias": "test",
+  "warning": "Public release has only one split. test is an evaluation alias, not an independent held-out split. This setup does not add these tasks to training.",
+  "files": {
+    "db": {
+      "rows": 500,
+      "sha256": "7370a26f0292b9b438b670015a8e7f5caceca0df80a132b21f451e9ff8d9c4a4",
+      "source_sha256": "9559d085c4747ae5afb28d45155040af0743e4dfdb5759a3f13da84501c52f51"
+    },
+    "os": {
+      "rows": 500,
+      "sha256": "3a8805e4bc23dabe62f2daf4b7dd78f372b6c733103549e719065c5f72fbe1b4",
+      "source_sha256": "61795fd6a0231fad9a509f8dbb8863bb0cdde1daa1db05e1b2e6dbb077946b13"
+    }
+  }
+}

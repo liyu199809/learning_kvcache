@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import os
+import sys
 import subprocess
 from pathlib import Path
 from typing import List, Optional
@@ -99,6 +100,7 @@ def _run_bfcl(
     port: str,
     args: List[str],
     api_model_id: str,
+    subset_ids_file: str | None = None,
 ) -> None:
     env = dict(os.environ)
     env["PYTHONPATH"] = (
@@ -111,8 +113,16 @@ def _run_bfcl(
     env["VLLM_PORT"] = port
     # 经 api_model_id.patch 解耦：API model id 独立于 --local-model-path。
     env["BFCL_API_MODEL_ID"] = api_model_id
+    if "--num-threads" in args:
+        thread_arg = args.index("--num-threads") + 1
+        env["BFCL_NUM_THREADS"] = args[thread_arg]
+    command = _bfcl_cmd(official_root, project_python, args)
+    if subset_ids_file:
+        command = [project_python, str(bfcl_root / "evaluate_subset.py"),
+                   "--ids", str(Path(subset_ids_file).resolve()),
+                   "--subset-dir", str(project_root_env / "subset_inputs"), *args]
     subprocess.run(
-        _bfcl_cmd(official_root, project_python, args),
+        command,
         cwd=str(bfcl_root),
         env=env,
         check=True,
@@ -155,7 +165,7 @@ def run_bfcl(args) -> int:
     official_root = _official_root(bfcl_root)
     project_python = os.getenv(
         "PROJECT_PYTHON",
-        str(Path(__file__).resolve().parents[2] / ".venv" / "bin" / "python"),
+        sys.executable,
     )
 
     _ensure_official(bfcl_root, official_root)
@@ -226,9 +236,11 @@ def run_bfcl(args) -> int:
     _run_bfcl(
         official_root=official_root, bfcl_root=bfcl_root, project_python=project_python,
         project_root_env=project_root_env, host=host, port=port, args=eval_args,
-        api_model_id=model_alias,
+        api_model_id=model_alias, subset_ids_file=run_ids_file,
     )
 
     # 3) scores（绕开官方 scores 子命令的列崩溃）
+    if run_ids_file:
+        print("[bfcl_v3] SUBSET SMOKE ONLY: not a full leaderboard score.")
     _print_scores(project_root_env / score_dir)
     return 0
