@@ -192,10 +192,16 @@ class ServerAdapter(BaseRollout):
         # verl jobs on the same host (or a new run after a crashed one with a
         # stale socket file) cannot collide on the shared /tmp namespace.
         local_rank = self.rollout_rank % local_world_size
-        job_id = ray.get_runtime_context().get_job_id()
+        job_id = os.environ.get("VERL_ZMQ_NAMESPACE") or ray.get_runtime_context().get_job_id()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
-        self.use_shm = not is_support_ipc()
+        force_shm = os.getenv("VERL_FORCE_SHM_WEIGHT_TRANSFER", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.use_shm = force_shm or not is_support_ipc()
         if self.use_shm:
             logger.warning(
                 "IPC is not supported on your devices. Falling back to shared memory for weight transfer, "
