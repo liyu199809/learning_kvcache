@@ -8,6 +8,8 @@ CONDA_BIN=${CONDA_BIN:-/usr/local/miniconda3/bin/conda}
 ENV_NAME=${ENV_NAME:-kvcache}
 ENV_PREFIX=${ENV_PREFIX:-/usr/local/miniconda3/envs/$ENV_NAME}
 PIP_INDEX_URL=${PIP_INDEX_URL:-https://mirrors.jd.com/pypi/web/simple}
+CAUSAL_CONV1D_VERSION=${CAUSAL_CONV1D_VERSION:-1.6.1}
+CAUSAL_CONV1D_MAX_JOBS=${CAUSAL_CONV1D_MAX_JOBS:-16}
 VERIFY_ONLY=0
 
 usage() {
@@ -30,6 +32,8 @@ Environment overrides:
   ENV_NAME       Conda environment name (default: kvcache)
   ENV_PREFIX     Environment path (default: /usr/local/miniconda3/envs/$ENV_NAME)
   PIP_INDEX_URL  Python package index URL (default: JD mirror)
+  CAUSAL_CONV1D_VERSION   causal-conv1d version (default: 1.6.1)
+  CAUSAL_CONV1D_MAX_JOBS  CUDA extension build parallelism (default: 16)
 EOF
 }
 
@@ -234,7 +238,27 @@ PY
         "${SERVICE_DEPS[@]}"
     assert_no_env_symlinks
 
-    echo "[4/5] Installing project packages in editable mode"
+    echo "[4/5] Installing CUDA fast kernels and project packages"
+    # The environment includes base site-packages, so a plain pip install can
+    # mistake base's ninja metadata for an environment-local executable. Force
+    # a regular-file ninja installation into ENV_PREFIX before compiling the
+    # causal-conv1d extension required by packed Qwen3.5 training.
+    "$PYTHON" -m pip install \
+        --ignore-installed \
+        --no-deps \
+        --no-cache-dir \
+        --index-url "$PIP_INDEX_URL" \
+        'ninja==1.13.2'
+    MAX_JOBS="$CAUSAL_CONV1D_MAX_JOBS" \
+    CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+    "$PYTHON" -m pip install \
+        --no-deps \
+        --no-build-isolation \
+        --no-cache-dir \
+        --index-url "$PIP_INDEX_URL" \
+        "causal-conv1d==$CAUSAL_CONV1D_VERSION"
+    assert_no_env_symlinks
+
     "$PYTHON" -m pip install \
         --no-deps \
         --no-build-isolation \
@@ -276,6 +300,7 @@ modules = (
     "transformers",
     "ray",
     "flash_attn",
+    "causal_conv1d",
     "verl",
     "openenv",
     "agent_world_model_env",
@@ -286,6 +311,7 @@ modules = (
     "prefix_tuning.virtual_prefix",
 )
 loaded = {name: importlib.import_module(name) for name in modules}
+importlib.import_module("causal_conv1d_cuda")
 
 torch = loaded["torch"]
 vllm = loaded["vllm"]
@@ -293,6 +319,11 @@ assert torch.cuda.is_available(), "PyTorch cannot access CUDA"
 assert torch.cuda.device_count() > 0, "No CUDA GPUs are visible"
 assert str(torch.version.cuda).startswith("13."), torch.version.cuda
 assert tuple(map(int, vllm.__version__.split(".")[:2])) >= (0, 22), vllm.__version__
+
+from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen3_5
+assert qwen3_5.is_fast_path_available, (
+    "Qwen3.5 packed training requires FLA and causal-conv1d fast kernels"
+)
 
 project_root = os.path.realpath(os.getcwd())
 for package in ("verl", "openenv"):
@@ -310,6 +341,8 @@ print("vllm", vllm.__version__)
 print("transformers", loaded["transformers"].__version__)
 print("ray", loaded["ray"].__version__)
 print("flash_attn", loaded["flash_attn"].__version__)
+print("causal_conv1d", metadata.version("causal-conv1d"))
+print("qwen3_5_fast_path", qwen3_5.is_fast_path_available)
 print("gpus", torch.cuda.device_count(), torch.cuda.get_device_name(0))
 print("vllm_plugin", "qwen35_delta_virtual_prefix")
 print("kvcache_environment_ready", True)
