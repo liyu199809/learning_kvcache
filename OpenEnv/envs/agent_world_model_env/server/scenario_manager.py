@@ -166,6 +166,19 @@ def _fix_generated_code_errors(full_code: str) -> str:
                 class_part = class_part.replace(
                     'validation_alias="metadata", ', ""
                 )
+        # The generic serialization-alias repair above and the ORM metadata
+        # repair can both add validation_alias to the same Field call.  Python
+        # rejects the generated module when that keyword appears twice.  Keep
+        # the first alias, which is the explicit/generated field-name mapping.
+        class_part = re.sub(
+            r'(validation_alias="[^"]+",\s*)validation_alias="[^"]+",\s*',
+            r"\1",
+            class_part,
+        )
+        class_part = class_part.replace(
+            'validation_alias="metadata_", validation_alias="metadata", ',
+            'validation_alias="metadata_", ',
+        )
         class_parts[index] = class_part
     full_code = "class ".join(class_parts)
 
