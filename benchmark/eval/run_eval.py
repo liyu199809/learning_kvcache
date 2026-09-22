@@ -113,6 +113,18 @@ def parse_args() -> argparse.Namespace:
                     help="启用 tau2 agent 的 Qwen thinking（默认关闭以提速）。")
     ap.add_argument("--tau2-user-thinking", action="store_true",
                     help="启用 tau2 user simulator 的 Qwen thinking（默认关闭）。")
+    ap.add_argument("--tau2-user-temperature", type=float, default=0.0,
+                    help="外部 user simulator 的温度；与被测 agent 解码参数隔离。")
+    ap.add_argument("--tau2-user-top-p", type=float, default=1.0,
+                    help="外部 user simulator 的 top-p；与被测 agent 解码参数隔离。")
+    ap.add_argument("--tau2-user-model", default=None,
+                    help="固定 user simulator 的 litellm 模型；默认使用外部 Ark 模型。")
+    ap.add_argument("--tau2-user-base-url", default=None,
+                    help="固定 user simulator 的 OpenAI 兼容 base URL。")
+    ap.add_argument("--tau2-user-api-key-env", default="ARK_API_KEY",
+                    help="user simulator API key 所在环境变量；key 不写入命令行或产物。")
+    ap.add_argument("--tau2-require-external-user", action="store_true",
+                    help="外部 user simulator 未配置时失败，禁止回退到被测模型。")
     # tau2 Retail NL 断言 judge（外部 OpenAI 兼容服务，默认火山方舟）：
     ap.add_argument("--tau2-judge-model", default=None,
                     help="judge 的 litellm 模型名（默认 openai/deepseek-v4-pro-ga-260813）。")
@@ -126,6 +138,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tau2-judge-thinking", action="store_true",
                     help="启用 judge 思考（默认关闭；Ark 的 budget_tokens "
                          "不生效，disabled 为最低档）。")
+    ap.add_argument("--tau2-judge-temperature", type=float, default=0.0,
+                    help="外部 NL judge 的温度；与被测 agent 解码参数隔离。")
+    ap.add_argument("--tau2-judge-top-p", type=float, default=1.0,
+                    help="外部 NL judge 的 top-p；与被测 agent 解码参数隔离。")
+    ap.add_argument("--tau2-require-external-judge", action="store_true",
+                    help="外部 judge 未配置时失败，禁止回退到被测模型。")
     from benchmark.eval.coding import add_coding_args
     add_coding_args(ap)
     return ap.parse_args()

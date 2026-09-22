@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 # Source this file before direct Python/CLI calls, or use benchmark/run.sh.
 BENCHMARK_PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+
+# Export credentials from the project-local .env to benchmark subprocesses.
+# Preserve the caller's allexport setting.
+if [[ -f "$BENCHMARK_PROJECT_ROOT/.env" ]]; then
+    case $- in
+        *a*) BENCHMARK_RESTORE_ALLEXPORT=0 ;;
+        *) BENCHMARK_RESTORE_ALLEXPORT=1; set -a ;;
+    esac
+    # shellcheck disable=SC1091
+    source "$BENCHMARK_PROJECT_ROOT/.env"
+    if [[ "$BENCHMARK_RESTORE_ALLEXPORT" == 1 ]]; then
+        set +a
+    fi
+    unset BENCHMARK_RESTORE_ALLEXPORT
+fi
+
 export PROJECT_PYTHON="${PROJECT_PYTHON:-$BENCHMARK_PROJECT_ROOT/benchmark/.venv/bin/python}"
 export PATH="$BENCHMARK_PROJECT_ROOT/benchmark/runtime/docker:$PATH"
 export DOCKER_HOST="${DOCKER_HOST:-unix://$BENCHMARK_PROJECT_ROOT/benchmark/runtime/docker.sock}"

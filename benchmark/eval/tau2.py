@@ -5,8 +5,9 @@
 
   - tau2 是带 user-simulator 的多轮对话 benchmark，判分（DB 末态 hash + communicate
     checks，pass^k 指标）全在官方代码，原样运行；
-  - 所有 LLM 调用走 litellm，用 openai/ provider + api_base 把 agent 与
-    user-simulator 两个模型都指向 start_services.sh 拉起的现有 vLLM；
+  - 所有 LLM 调用走 litellm。被测 agent 指向 start_services.sh 拉起的现有
+    vLLM；user-simulator 与自然语言断言 judge 默认固定到外部模型，避免它们随
+    被测模型变化而污染对比结果；
   - 官方产物落到统一 output-dir：--save-to 传绝对路径时，官方的
     ``DATA_DIR / "simulations" / <save_to>`` 会被 pathlib 折叠成该绝对路径本身，
     从而与其它 benchmark 同处一棵产物树，且不干扰 TAU2_DATA_DIR 的任务加载。
@@ -26,8 +27,11 @@ DEFAULT_TAU2_MAX_COMPLETION_TOKENS = 4096
 DEFAULT_TAU2_USER_MAX_COMPLETION_TOKENS = 4096
 DEFAULT_TAU2_MAX_STEPS = 50
 
-# Retail 自然语言断言 judge 默认走火山方舟（OpenAI 兼容）。API key 只从环境变量
-# 读取，绝不写入代码/命令行/产物。
+# User simulator 与 Retail 自然语言断言 judge 默认走火山方舟（OpenAI 兼容）。
+# API key 只从环境变量读取，绝不写入代码/命令行/产物。
+DEFAULT_TAU2_USER_MODEL = "openai/deepseek-v4-pro-ga-260813"
+DEFAULT_TAU2_USER_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+DEFAULT_TAU2_USER_API_KEY_ENV = "ARK_API_KEY"
 DEFAULT_TAU2_JUDGE_MODEL = "openai/deepseek-v4-pro-ga-260813"
 DEFAULT_TAU2_JUDGE_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_TAU2_JUDGE_API_KEY_ENV = "ARK_API_KEY"
@@ -74,7 +78,8 @@ def run_tau2(args) -> int:
 
     tau2_bin = venv_dir / "bin" / "tau2"
 
-    # litellm 路由：openai/ provider + api_base 指向本地 vLLM，agent 与 user 同源。
+    # 被测 agent 固定走本地 vLLM，并把路由信息显式写进参数，避免被进程级
+    # OPENAI_API_BASE/OPENAI_API_KEY（供外部 user/judge 使用）覆盖。
     base_url = args.openai_base_url
     model_alias = args.model
     _check_server(base_url, model_alias)
@@ -85,18 +90,15 @@ def run_tau2(args) -> int:
         if args.llm_max_completion_tokens is not None
         else DEFAULT_TAU2_MAX_COMPLETION_TOKENS
     )
-    common_llm_args = {
+    agent_llm_args = {
         "api_base": base_url,
         "api_key": args.api_key or "EMPTY",
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "max_tokens": max_completion_tokens,
     }
     agent_thinking = getattr(args, "tau2_agent_thinking", False)
     user_thinking = getattr(args, "tau2_user_thinking", False)
-    agent_llm_args = {
-        **common_llm_args,
-        "max_tokens": max_completion_tokens,
-    }
     if not agent_thinking:
         agent_llm_args["extra_body"] = {
             "chat_template_kwargs": {"enable_thinking": False}
@@ -107,14 +109,49 @@ def run_tau2(args) -> int:
     user_max_completion_tokens = min(
         max_completion_tokens, DEFAULT_TAU2_USER_MAX_COMPLETION_TOKENS
     )
-    user_llm_args = {
-        **common_llm_args,
-        "max_tokens": user_max_completion_tokens,
-    }
-    if not user_thinking:
-        user_llm_args["extra_body"] = {
-            "chat_template_kwargs": {"enable_thinking": False}
+    user_api_key_env = (
+        getattr(args, "tau2_user_api_key_env", None)
+        or DEFAULT_TAU2_USER_API_KEY_ENV
+    )
+    user_api_key = os.getenv(user_api_key_env)
+    if user_api_key:
+        user_llm_model = (
+            getattr(args, "tau2_user_model", None) or DEFAULT_TAU2_USER_MODEL
+        )
+        user_base_url = (
+            getattr(args, "tau2_user_base_url", None)
+            or DEFAULT_TAU2_USER_BASE_URL
+        )
+        user_llm_args = {
+            "api_base": user_base_url,
+            "temperature": getattr(args, "tau2_user_temperature", 0.0),
+            "top_p": getattr(args, "tau2_user_top_p", 1.0),
+            "max_tokens": user_max_completion_tokens,
         }
+        if not user_thinking:
+            user_llm_args["extra_body"] = {"thinking": {"type": "disabled"}}
+    else:
+        if getattr(args, "tau2_require_external_user", False):
+            raise SystemExit(
+                f"tau2 外部 user simulator 必需，但环境变量 {user_api_key_env} 未设置"
+            )
+        print(
+            f"[tau2] 未设置 {user_api_key_env}，user simulator 回退本地 vLLM "
+            f"({llm_model})。"
+        )
+        user_llm_model = llm_model
+        user_base_url = base_url
+        user_llm_args = {
+            "api_base": base_url,
+            "api_key": args.api_key or "EMPTY",
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_tokens": user_max_completion_tokens,
+        }
+        if not user_thinking:
+            user_llm_args["extra_body"] = {
+                "chat_template_kwargs": {"enable_thinking": False}
+            }
     agent_llm_args_json = json.dumps(agent_llm_args)
     user_llm_args_json = json.dumps(user_llm_args)
     max_steps = (
@@ -132,7 +169,7 @@ def run_tau2(args) -> int:
         "--domain", args.tau2_domain,
         "--agent-llm", llm_model,
         "--agent-llm-args", agent_llm_args_json,
-        "--user-llm", llm_model,
+        "--user-llm", user_llm_model,
         "--user-llm-args", user_llm_args_json,
         "--task-split-name", args.tau2_split,
         "--num-trials", str(args.tau2_num_trials),
@@ -144,11 +181,8 @@ def run_tau2(args) -> int:
         cmd += ["--num-tasks", str(args.tau2_num_tasks)]
     if args.task_ids:
         cmd += ["--task-ids", *str(args.task_ids).replace(",", " ").split()]
-    # litellm 仍要求存在 API key（本地 vLLM 用占位）；同时通过环境变量兜底，
-    # 覆盖 openai/ provider 的 base_url/key（与 --agent-llm-args 双保险）。
+    # 外部 key 只通过子进程环境传递。命令行与产物只包含 api_base，不包含 key。
     env = dict(os.environ)
-    env.setdefault("OPENAI_API_KEY", args.api_key or "EMPTY")
-    env["OPENAI_API_BASE"] = base_url
     # Retail includes natural-language assertions.  Upstream defaults their
     # judge to GPT-4.1; route this judge to an external OpenAI-compatible
     # model (Volcano Ark deepseek by default) whenever its API key is present
@@ -163,9 +197,8 @@ def run_tau2(args) -> int:
         judge_base_url = getattr(args, "tau2_judge_base_url", None) or DEFAULT_TAU2_JUDGE_BASE_URL
         nl_judge_args = {
             "api_base": judge_base_url,
-            "api_key": judge_api_key,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
+            "temperature": getattr(args, "tau2_judge_temperature", 0.0),
+            "top_p": getattr(args, "tau2_judge_top_p", 1.0),
             "max_tokens": max_completion_tokens,
         }
         # 思考长度默认压到最低：Ark 的 budget_tokens 不生效（实测 budget=1 反而
@@ -173,16 +206,38 @@ def run_tau2(args) -> int:
         if not judge_thinking:
             nl_judge_args["extra_body"] = {"thinking": {"type": "disabled"}}
     else:
+        if getattr(args, "tau2_require_external_judge", False):
+            raise SystemExit(
+                f"tau2 外部 NL judge 必需，但环境变量 {judge_api_key_env} 未设置"
+            )
         print(
             f"[tau2] 未设置 {judge_api_key_env}，NL 断言 judge 回退本地 vLLM 模型 "
             f"({llm_model})。"
         )
         judge_llm_model = llm_model
         nl_judge_args = {
-            **common_llm_args,
+            **agent_llm_args,
             "max_tokens": max_completion_tokens,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
         }
+    external_credentials = []
+    if user_api_key:
+        external_credentials.append((user_api_key, user_base_url, "user simulator"))
+    if judge_api_key:
+        external_credentials.append((judge_api_key, judge_base_url, "NL judge"))
+    if external_credentials:
+        first_key, first_base, first_role = external_credentials[0]
+        for key, endpoint, role in external_credentials[1:]:
+            if key != first_key or endpoint != first_base:
+                raise SystemExit(
+                    "tau2 当前子进程只支持 user simulator 与 NL judge 共用一组外部 "
+                    f"OpenAI 凭据；{first_role} 与 {role} 的 key/base 不一致"
+                )
+        env["OPENAI_API_KEY"] = first_key
+        env["OPENAI_API_BASE"] = first_base
+    else:
+        env["OPENAI_API_KEY"] = args.api_key or "EMPTY"
+        env["OPENAI_API_BASE"] = base_url
     env["TAU2_LLM_NL_ASSERTIONS"] = judge_llm_model
     env["TAU2_LLM_NL_ASSERTIONS_ARGS"] = json.dumps(nl_judge_args)
     # tau2 runs one synchronous LiteLLM call per simulation worker.  Size the
@@ -199,7 +254,11 @@ def run_tau2(args) -> int:
     print("tau2-bench (official pipeline)")
     print("=" * 72)
     print(f"Domain:       {args.tau2_domain}  split={args.tau2_split}")
-    print(f"Agent/User:   {llm_model} @ {base_url}")
+    print(f"Agent:        {llm_model} @ {base_url}")
+    print(
+        f"User:         {user_llm_model} @ {user_base_url}"
+        + (" (external)" if user_api_key else " (fallback)")
+    )
     print(f"Trials:       {args.tau2_num_trials}   concurrency={args.concurrency}")
     print(f"Max steps:    {max_steps}")
     print(
