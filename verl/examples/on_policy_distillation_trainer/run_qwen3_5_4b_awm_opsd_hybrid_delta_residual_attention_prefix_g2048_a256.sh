@@ -27,7 +27,10 @@ ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-$REPO_ROOT/rollout_trajs/$RUN_NAME}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-24}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-20}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
-ACTOR_LR=${ACTOR_LR:-5e-6}
+ACTOR_LR=${ACTOR_LR:-1e-5}
+ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
+TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-False}
+ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-0.6}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-28672}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-40960}
@@ -155,6 +158,7 @@ START_TIME=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="$REPO_ROOT/logs/${RUN_NAME}_${START_TIME}.log"
 TRAIN_ROWS=$(python -c 'import pyarrow.parquet as pq,sys; print(pq.read_metadata(sys.argv[1]).num_rows)' "$TRAIN_FILE")
 echo "Training: $TRAIN_ROWS rows, batch $TRAIN_BATCH_SIZE, $TOTAL_EPOCHS epochs; actor GPUs=6, teacher GPUs=2"
+echo "Optimization: lr=$ACTOR_LR rollout_temperature=$ROLLOUT_TEMPERATURE rollout_eager=$ROLLOUT_ENFORCE_EAGER teacher_eager=$TEACHER_ENFORCE_EAGER"
 echo "Actor: $ACTOR_MODEL (112 hybrid prefix tensors; 315,621,376 parameters)"
 echo "Teacher: $TEACHER_MODEL"
 echo "Checkpoints: $CHECKPOINT_DIR"
@@ -206,10 +210,10 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
-    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.enforce_eager="$ROLLOUT_ENFORCE_EAGER" \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.do_sample=True \
-    actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.temperature="$ROLLOUT_TEMPERATURE" \
     actor_rollout_ref.rollout.max_model_len="$MAX_MODEL_LEN" \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.layered_summon=False \
@@ -253,7 +257,7 @@ python -m verl.trainer.main_ppo \
     distillation.teacher_models.teacher_model.inference.name=vllm \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.65 \
-    distillation.teacher_models.teacher_model.inference.enforce_eager=True \
+    distillation.teacher_models.teacher_model.inference.enforce_eager="$TEACHER_ENFORCE_EAGER" \
     distillation.teacher_models.teacher_model.inference.max_model_len="$MAX_MODEL_LEN" \
     distillation.privileged_mode=append \
     distillation.privileged_insert_before=$'"<|im_end|>\n<|im_start|>assistant\n"' \

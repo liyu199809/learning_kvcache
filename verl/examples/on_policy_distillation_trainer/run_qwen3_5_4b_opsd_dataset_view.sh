@@ -70,9 +70,9 @@ VAL_FILE=${VAL_FILE:-$DATA_ROOT/val.parquet}
 PROJECT_NAME=${PROJECT_NAME:-self_evolver_opsd_3way}
 
 if [[ "$RUN_MODE" == smoke ]]; then
-    ACTOR_GPUS=${ACTOR_GPUS:-2}
+    ACTOR_GPUS=${ACTOR_GPUS:-1}
     TEACHER_GPUS=${TEACHER_GPUS:-1}
-    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2}
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
     TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-2}
     VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-2}
     TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
@@ -94,9 +94,9 @@ else
         echo "RUN_MODE must be 'full' or 'smoke'; got '$RUN_MODE'." >&2
         exit 2
     fi
-    ACTOR_GPUS=${ACTOR_GPUS:-6}
-    TEACHER_GPUS=${TEACHER_GPUS:-2}
-    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+    ACTOR_GPUS=${ACTOR_GPUS:-1}
+    TEACHER_GPUS=${TEACHER_GPUS:-1}
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
     TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-24}
     # Evaluate the complete 100-row validation set in one request wave. The
     # agent-loop dispatcher selects an exact worker divisor, so no samples are
@@ -131,14 +131,16 @@ CHECKPOINT_DIR=${CHECKPOINT_DIR:-$REPO_ROOT/checkpoints/$PROJECT_NAME/$RUN_NAME}
 ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-$REPO_ROOT/rollout_trajs/$RUN_NAME}
 
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-28672}
-ACTOR_LR=${ACTOR_LR:-1e-6}
+ACTOR_LR=${ACTOR_LR:-1e-5}
 DISTILLATION_TOPK=${DISTILLATION_TOPK:-64}
 # TACO can produce 16K-token responses. Keep the mathematically equivalent
 # full-vocabulary logsumexp in small token chunks so its fp32 scratch buffer
 # cannot consume several GiB during the distillation update.
 DISTILLATION_TOPK_CHUNK_SIZE=${DISTILLATION_TOPK_CHUNK_SIZE:-512}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}
-ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
+ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
+TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-True}
+ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-0.6}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-49152}
 
 if [[ ! -f "$MODEL/config.json" ]]; then
@@ -241,6 +243,7 @@ echo "OPSD view=$VIEW mode=$RUN_MODE train=$TRAIN_ROWS val=$VAL_ROWS"
 echo "thinking=$ENABLE_THINKING turns=$MAX_ASSISTANT_TURNS/$MAX_USER_TURNS repetition_penalty=1.0"
 echo "tokens: prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH model=$MAX_MODEL_LEN"
 echo "actor GPUs=$ACTOR_GPUS teacher GPUs=$TEACHER_GPUS batch=$TRAIN_BATCH_SIZE"
+echo "optimization: lr=$ACTOR_LR rollout_temperature=$ROLLOUT_TEMPERATURE rollout_eager=$ROLLOUT_ENFORCE_EAGER teacher_eager=$TEACHER_ENFORCE_EAGER"
 echo "student model=$MODEL teacher model=$TEACHER_MODEL"
 echo "Log: $LOG_FILE"
 
@@ -292,7 +295,7 @@ fi
     actor_rollout_ref.rollout.enforce_eager="$ROLLOUT_ENFORCE_EAGER" \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.do_sample=True \
-    actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.temperature="$ROLLOUT_TEMPERATURE" \
     +actor_rollout_ref.rollout.repetition_penalty=1.0 \
     actor_rollout_ref.rollout.max_model_len="$MAX_MODEL_LEN" \
     actor_rollout_ref.rollout.max_num_batched_tokens="$MAX_NUM_BATCHED_TOKENS" \
@@ -336,7 +339,7 @@ fi
     distillation.teacher_models.teacher_model.inference.name=vllm \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization="$GPU_MEMORY_UTILIZATION" \
-    distillation.teacher_models.teacher_model.inference.enforce_eager=True \
+    distillation.teacher_models.teacher_model.inference.enforce_eager="$TEACHER_ENFORCE_EAGER" \
     distillation.teacher_models.teacher_model.inference.max_model_len="$MAX_MODEL_LEN" \
     distillation.privileged_mode=append \
     distillation.privileged_insert_before=$'"<|im_end|>\n<|im_start|>assistant\n"' \
