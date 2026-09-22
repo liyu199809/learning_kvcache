@@ -162,10 +162,29 @@ fi
 assert_no_env_symlinks
 
 if [[ "$VERIFY_ONLY" == 0 ]]; then
-    echo "[2/5] Configuring Conda activation metadata"
-    mkdir -p -- "$ENV_PREFIX/conda-meta"
+    echo "[2/5] Configuring Conda activation metadata and pip entrypoints"
+    mkdir -p -- "$ENV_PREFIX/conda-meta" "$ENV_PREFIX/etc/conda/activate.d"
     : > "$ENV_PREFIX/conda-meta/history"
     chmod 0644 "$ENV_PREFIX/conda-meta/history"
+
+    for pip_command in pip pip3 pip3.12; do
+        pip_entrypoint="$ENV_PREFIX/bin/$pip_command"
+        fail_if_symlink "$pip_entrypoint"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            "exec '$PYTHON' -m pip \"\$@\"" \
+            > "$pip_entrypoint"
+        chmod 0755 "$pip_entrypoint"
+    done
+
+    PIP_ACTIVATE_HOOK="$ENV_PREFIX/etc/conda/activate.d/kvcache-pip.sh"
+    fail_if_symlink "$PIP_ACTIVATE_HOOK"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'unalias pip 2>/dev/null || true' \
+        'hash -r 2>/dev/null || true' \
+        > "$PIP_ACTIVATE_HOOK"
+    chmod 0644 "$PIP_ACTIVATE_HOOK"
     assert_no_env_symlinks
 
     echo "[3/5] Downloading and checking service dependency wheels"
