@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 VERL_ROOT="$REPO_ROOT/verl"
 EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-$REPO_ROOT/outputs/prefix_composition_3domain_20260917}
 export NO_PROXY="localhost,127.0.0.1,${NO_PROXY:-}"
@@ -13,7 +13,7 @@ export NO_PROXY="$(hostname -I | tr ' ' ','),$NO_PROXY"
 export no_proxy="$NO_PROXY"
 # TileLang links system libz3, which needs a newer C++ ABI than Conda provides.
 # Scope the compatible system runtime to this launcher and its Ray children.
-export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libstdc++.so.6${LD_PRELOAD:+:$LD_PRELOAD}"
+export LD_PRELOAD="/usr/local/miniconda3/lib/libstdc++.so.6${LD_PRELOAD:+:$LD_PRELOAD}"
 
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python)}
 cd "$REPO_ROOT"
@@ -77,9 +77,9 @@ VAL_FILE=${VAL_FILE:-$DATA_ROOT/val.parquet}
 PROJECT_NAME=${PROJECT_NAME:-self_evolver_opsd_3way}
 
 if [[ "$RUN_MODE" == smoke ]]; then
-    ACTOR_GPUS=${ACTOR_GPUS:-2}
+    ACTOR_GPUS=${ACTOR_GPUS:-1}
     TEACHER_GPUS=${TEACHER_GPUS:-1}
-    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2}
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
     TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-2}
     VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-2}
     TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
@@ -95,15 +95,14 @@ if [[ "$RUN_MODE" == smoke ]]; then
     TEST_FREQ=${TEST_FREQ:--1}
     SAVE_FREQ=${SAVE_FREQ:--1}
     RESUME_MODE=${RESUME_MODE:-disable}
-    LOGGER_OVERRIDE=trainer.logger=console
 else
     if [[ "$RUN_MODE" != full ]]; then
         echo "RUN_MODE must be 'full' or 'smoke'; got '$RUN_MODE'." >&2
         exit 2
     fi
-    ACTOR_GPUS=${ACTOR_GPUS:-6}
-    TEACHER_GPUS=${TEACHER_GPUS:-2}
-    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+    ACTOR_GPUS=${ACTOR_GPUS:-1}
+    TEACHER_GPUS=${TEACHER_GPUS:-1}
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
     TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-24}
     # Evaluate the complete 100-row validation set in one request wave. The
     # agent-loop dispatcher selects an exact worker divisor, so no samples are
@@ -121,12 +120,15 @@ else
     NUM_WORKERS=${NUM_WORKERS:-24}
     FILTER_WORKERS=${FILTER_WORKERS:-4}
     DATALOADER_WORKERS=${DATALOADER_WORKERS:-4}
-    # Evaluation is pending until the user finalizes the validation datasets.
     VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False}
     TEST_FREQ=${TEST_FREQ:--1}
     SAVE_FREQ=${SAVE_FREQ:-20}
     RESUME_MODE=${RESUME_MODE:-auto}
-    LOGGER_OVERRIDE=trainer.logger=console
+fi
+
+LOGGER_OVERRIDE=trainer.logger=console
+if [[ "${USE_WANDB:-0}" == 1 ]]; then
+    LOGGER_OVERRIDE='trainer.logger=["console","wandb"]'
 fi
 
 if [[ "$RUN_MODE" == smoke ]]; then
@@ -141,7 +143,7 @@ ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-$EXPERIMENT_ROOT/rollouts/$RUN_NAME}
 # Every domain uses the shared EnvScaler/TACO validation set, including prompts
 # over 4K. Keep its full audited prompt budget even when TACO train rows are short.
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-28672}
-ACTOR_LR=${ACTOR_LR:-5e-6}
+ACTOR_LR=${ACTOR_LR:-1e-5}
 DISTILLATION_TOPK=${DISTILLATION_TOPK:-64}
 # TACO can produce 16K-token responses. Keep the mathematically equivalent
 # full-vocabulary logsumexp in small token chunks so its fp32 scratch buffer
@@ -149,6 +151,12 @@ DISTILLATION_TOPK=${DISTILLATION_TOPK:-64}
 DISTILLATION_TOPK_CHUNK_SIZE=${DISTILLATION_TOPK_CHUNK_SIZE:-512}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}
 ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
+TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-True}
+ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
+TEACHER_TEMPERATURE=${TEACHER_TEMPERATURE:-1.0}
+# Ray can miss NPU resources for nonzero Ascend visibility ranges (for example 2,3).
+# Each run owns one actor and one teacher device, so declare that local resource explicitly.
+RAY_NPU_RESOURCES=${RAY_NPU_RESOURCES:-$((ACTOR_GPUS + TEACHER_GPUS))}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-49152}
 
 if [[ ! -f "$MODEL/config.json" ]]; then
@@ -249,9 +257,12 @@ export HYDRA_FULL_ERROR=1
 export NO_PROXY="localhost,127.0.0.1,${NO_PROXY:-}"
 export no_proxy="$NO_PROXY"
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
-export WANDB_MODE=offline
+export WANDB_MODE=${WANDB_MODE:-offline}
 # Ray uses Unix sockets with a 107-byte path limit; transient IPC must be local/short.
 export RAY_TMPDIR=${RAY_TMPDIR:-/tmp/kvcache-prefix-ray}
+# Separate local Ray clusters all start with job id 01000000.  A per-launch
+# namespace keeps their colocated vLLM weight-sync sockets from colliding.
+export VERL_ZMQ_NAMESPACE=${VERL_ZMQ_NAMESPACE:-$(basename -- "$RAY_TMPDIR")-$$}
 export HF_MODULES_CACHE="$EXPERIMENT_ROOT/cache/hf_modules"
 export TRITON_CACHE_DIR="$EXPERIMENT_ROOT/cache/triton"
 export VLLM_CACHE_ROOT="$EXPERIMENT_ROOT/cache/vllm"
@@ -268,6 +279,9 @@ echo "OPSD view=$VIEW mode=$RUN_MODE train=$TRAIN_ROWS val=$VAL_ROWS"
 echo "thinking=$ENABLE_THINKING turns=$MAX_ASSISTANT_TURNS/$MAX_USER_TURNS repetition_penalty=1.0"
 echo "tokens: prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH model=$MAX_MODEL_LEN"
 echo "actor GPUs=$ACTOR_GPUS teacher GPUs=$TEACHER_GPUS batch=$TRAIN_BATCH_SIZE"
+echo "optimization: lr=$ACTOR_LR rollout_temperature=$ROLLOUT_TEMPERATURE teacher_temperature=$TEACHER_TEMPERATURE rollout_eager=$ROLLOUT_ENFORCE_EAGER teacher_eager=$TEACHER_ENFORCE_EAGER"
+echo "validation: before_train=$VAL_BEFORE_TRAIN every_steps=$TEST_FREQ"
+echo "logging: $LOGGER_OVERRIDE wandb_mode=$WANDB_MODE project=$WANDB_PROJECT"
 echo "student model=$MODEL teacher model=$TEACHER_MODEL"
 echo "Log: $LOG_FILE"
 
@@ -331,7 +345,7 @@ fi
     actor_rollout_ref.rollout.enforce_eager="$ROLLOUT_ENFORCE_EAGER" \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.do_sample=True \
-    actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.temperature="$ROLLOUT_TEMPERATURE" \
     +actor_rollout_ref.rollout.repetition_penalty=1.0 \
     actor_rollout_ref.rollout.max_model_len="$MAX_MODEL_LEN" \
     actor_rollout_ref.rollout.max_num_batched_tokens="$MAX_NUM_BATCHED_TOKENS" \
@@ -369,6 +383,7 @@ fi
     trainer.total_epochs="$TOTAL_EPOCHS" \
     trainer.resume_mode="$RESUME_MODE" \
     trainer.use_v1=False \
+    +ray_kwargs.ray_init.resources.NPU="$RAY_NPU_RESOURCES" \
     distillation.enabled=True \
     distillation.self_distillation=True \
     distillation.n_gpus_per_node="$TEACHER_GPUS" \
@@ -377,7 +392,8 @@ fi
     distillation.teacher_models.teacher_model.inference.name=vllm \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization="$GPU_MEMORY_UTILIZATION" \
-    distillation.teacher_models.teacher_model.inference.enforce_eager=True \
+    distillation.teacher_models.teacher_model.inference.enforce_eager="$TEACHER_ENFORCE_EAGER" \
+    distillation.teacher_models.teacher_model.inference.temperature="$TEACHER_TEMPERATURE" \
     distillation.teacher_models.teacher_model.inference.max_model_len="$MAX_MODEL_LEN" \
     distillation.teacher_models.teacher_model.inference.max_num_seqs=64 \
     '+distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm.limit_mm_per_prompt={image:0,video:0}' \

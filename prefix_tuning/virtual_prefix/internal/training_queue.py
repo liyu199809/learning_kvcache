@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Run two isolated four-GPU prefix trainers, then occupy the freed slot."""
+"""Run the three domain trainers serially, each owning all eight GPUs.
+
+Every job uses six actor (student) GPUs and two teacher GPUs; the domains run
+one after another so only one trainer touches the node at a time.
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,17 +12,23 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
 import time
 
 import psutil
 
-ROOT = Path(__file__).resolve().parents[2]
-EXP = ROOT / "outputs/prefix_composition_3domain_20260917"
+ROOT = Path(__file__).resolve().parents[3]
+EXP = Path(os.environ.get(
+    "EXPERIMENT_ROOT", ROOT / "outputs/prefix_composition_3domain_20260917"
+)).resolve()
+LAUNCHER = ROOT / "experiment.sh"
 SCRIPT = ROOT / "prefix_tuning/virtual_prefix"
-SLOTS = {"a": "0,1,2,3", "b": "4,5,6,7"}
+DEVICES = os.environ.get("TRAIN_DEVICES", "0,1,2,3,4,5,6,7")
+ACTOR_GPUS = os.environ.get("TRAIN_ACTOR_GPUS", "6")
+TEACHER_GPUS = os.environ.get("TRAIN_TEACHER_GPUS", "2")
+DOMAINS = ("awm", "envscaler", "taco")
+GPUS_PER_JOB = len([device for device in DEVICES.split(",") if device.strip()])
 
 
 def now():
@@ -31,8 +41,12 @@ def atomic_json(path, value):
     os.replace(temp, path)
 
 
+def run_name(domain):
+    return f"{domain}_{GPUS_PER_JOB}gpu"
+
+
 def checkpoint_dir(domain):
-    return EXP / "checkpoints" / f"{domain}_4gpu"
+    return EXP / "checkpoints" / run_name(domain)
 
 
 def capture(job):
@@ -69,28 +83,32 @@ def cleanup(job):
     assert not [p for p in remaining if p.status() != psutil.STATUS_ZOMBIE], "Job cleanup incomplete"
 
 
-def start(domain, slot, resume):
+def start(domain, resume):
     env = os.environ.copy()
-    env.update(CUDA_VISIBLE_DEVICES=SLOTS[slot], ACTOR_GPUS="3", TEACHER_GPUS="1",
-               RUN_MODE="full", RUN_NAME=f"{domain}_4gpu", RESUME_MODE="resume_path" if resume else "disable",
-               CHECKPOINT_DIR=str(checkpoint_dir(domain)), VAL_BEFORE_TRAIN="False", TEST_FREQ="-1",
+    env.update(CUDA_VISIBLE_DEVICES=DEVICES, ASCEND_RT_VISIBLE_DEVICES=DEVICES,
+               ACTOR_GPUS=ACTOR_GPUS, TEACHER_GPUS=TEACHER_GPUS,
+               RUN_MODE="full", RUN_NAME=run_name(domain),
+               RESUME_MODE="resume_path" if resume else "disable",
+               CHECKPOINT_DIR=str(checkpoint_dir(domain)),
                TRAIN_BATCH_SIZE="24", PPO_MINI_BATCH_SIZE="24", PYTHONUNBUFFERED="1",
                RAY_TMPDIR=f"/tmp/kvcache-prefix-{domain}", RAY_ADDRESS="local",
                EXPERIMENT_ROOT=str(EXP))
-    args = ["bash", str(SCRIPT / "run_three_domain_prefix.sh"), domain,
-            "+ray_kwargs.ray_init.address=local", "ray_kwargs.ray_init.num_cpus=48",
-            "+ray_kwargs.ray_init.num_gpus=4", "+ray_kwargs.ray_init.include_dashboard=False",
+    args = ["bash", str(LAUNCHER), "_train-domain", domain,
+            "+ray_kwargs.ray_init.address=local", "ray_kwargs.ray_init.num_cpus=28",
+            f"+ray_kwargs.ray_init.num_gpus={GPUS_PER_JOB}",
+            "+ray_kwargs.ray_init.include_dashboard=False",
             "+ray_kwargs.ray_init.object_store_memory=8589934592"]
     if resume:
         args.append(f"trainer.resume_from_path={resume}")
-    logfile = EXP / "logs" / f"parallel_{domain}_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    logfile = EXP / "logs" / f"serial_{domain}_{time.strftime('%Y%m%d_%H%M%S')}.log"
     with logfile.open("a") as handle:
         process = subprocess.Popen(args, cwd=ROOT, env=env, stdout=handle,
                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                    start_new_session=True)
-    print(f"{now()} started {domain} pid={process.pid} slot={slot} GPUs={SLOTS[slot]}", flush=True)
-    return dict(domain=domain, slot=slot, gpus=SLOTS[slot], process=process,
-                children={}, log=str(logfile), started_at=now())
+    print(f"{now()} started {domain} pid={process.pid} GPUs={DEVICES} "
+          f"actor={ACTOR_GPUS} teacher={TEACHER_GPUS}", flush=True)
+    return dict(domain=domain, gpus=DEVICES, actor=ACTOR_GPUS, teacher=TEACHER_GPUS,
+                process=process, children={}, log=str(logfile), started_at=now())
 
 
 def export(domain):
@@ -105,66 +123,48 @@ def export(domain):
                    cwd=ROOT, env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}, check=True)
 
 
-def occupy(slot):
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": SLOTS[slot]}
-    log = EXP / "logs" / f"gpu_occupier_slot_{slot}.log"
-    with log.open("a") as handle:
-        process = subprocess.Popen([sys.executable, str(ROOT / "gpu_load.py"), "--devices", "all",
-                                    "--memory-percent", "70", "--utilization", "100",
-                                    "--duration", "86400"], cwd=ROOT, env=env, stdout=handle,
-                                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                   start_new_session=True)
-    record = dict(pid=process.pid, slot=slot, gpus=SLOTS[slot], started_at=now(),
-                  duration_seconds=86400, log=str(log))
-    atomic_json(EXP / "gpu_occupier_status.json", record)
-    print(f"{now()} occupier {record}", flush=True)
-    return record
-
-
 def run(resume):
     (EXP / "logs").mkdir(parents=True, exist_ok=True)
     with (EXP / "training_queue.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        pending = ["taco"]
-        running = {"a": start("awm", "a", resume), "b": start("envscaler", "b", None)}
-        completed, failed, holder = [], {}, None
+        completed, failed = [], {}
 
-        def status(state="running"):
+        def status(state="running", current=None):
             atomic_json(EXP / "queue_status.json", dict(
-                phase="parallel_training", state=state, pid=os.getpid(), updated_at=now(),
-                evaluation_status="pending_dataset", pending=pending, completed=completed, failed=failed,
-                running={s: {k: v for k, v in j.items() if k not in ("process", "children")}
-                         | {"pid": j["process"].pid} for s, j in running.items()}, occupier=holder))
+                phase="serial_training", state=state, pid=os.getpid(), updated_at=now(),
+                evaluation_status="pending_dataset", pending=[], completed=completed, failed=failed,
+                running={} if current is None else {
+                    current["domain"]: {k: v for k, v in current.items()
+                                        if k not in ("process", "children")}
+                    | {"pid": current["process"].pid}}))
 
-        status()
-        while running:
-            for slot, job in list(running.items()):
+        first_resume = resume
+        for domain in DOMAINS:
+            job = start(domain, first_resume if domain == "awm" else None)
+            first_resume = None
+            status(current=job)
+            while True:
                 capture(job)
                 code = job["process"].poll()
-                if code is None:
-                    continue
-                cleanup(job)
-                del running[slot]
-                if code != 0:
-                    failed[job["domain"]] = dict(exit_code=code, log=job["log"])
-                    print(f"{now()} failed {job['domain']} code={code}", flush=True)
-                    # Preserve the other domain's progress; do not silently reuse a failed slot.
-                else:
-                    try:
-                        export(job["domain"])
-                        completed.append(job["domain"])
-                    except Exception as exc:
-                        failed[job["domain"]] = dict(export_error=repr(exc))
-                    if pending and not failed:
-                        running[slot] = start(pending.pop(0), slot, None)
-                    elif not pending and len(running) == 1 and holder is None and not failed:
-                        holder = occupy(slot)
-                status("failed" if failed else "running")
+                if code is not None:
+                    break
+                status(current=job)
+                time.sleep(5)
+            cleanup(job)
+            if code != 0:
+                failed[domain] = dict(exit_code=code, log=job["log"])
+                print(f"{now()} failed {domain} code={code}", flush=True)
+                # Preserve the remaining domains' progress.
+            else:
+                try:
+                    export(domain)
+                    completed.append(domain)
+                except Exception as exc:
+                    failed[domain] = dict(export_error=repr(exc))
             status("failed" if failed else "running")
-            time.sleep(5)
-        if failed or pending:
+        if failed:
             status("failed")
-            raise RuntimeError(f"Training queue failed: {failed}; pending={pending}")
+            raise RuntimeError(f"Training queue failed: {failed}")
         for domains in (("awm", "envscaler"), ("awm", "taco"), ("envscaler", "taco"),
                         ("awm", "envscaler", "taco")):
             command = [sys.executable, "-m", "prefix_tuning.virtual_prefix.compose_hybrid_prefixes"]

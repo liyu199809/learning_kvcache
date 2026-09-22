@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start two local-DP vLLM services for two prefix evaluations."""
+"""Start four two-GPU local-DP vLLM services for the formal rerun."""
 from __future__ import annotations
 
 import json
@@ -7,15 +7,20 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 import urllib.request
 
-ROOT = Path(__file__).resolve().parents[2]
-EXP = ROOT / "outputs/prefix_composition_3domain_20260917"
+ROOT = Path(__file__).resolve().parents[3]
+EXP = Path(os.environ.get(
+    "EXPERIMENT_ROOT", ROOT / "outputs/prefix_composition_3domain_20260917"
+)).resolve()
 STATE = EXP / "eval/active_prefix_eval_services.json"
 SPECS = (
-    ("awm", "4,5", 18140, 18150, "prefix-awm", EXP / "prefixes/awm"),
-    ("envscaler", "6,7", 18142, 18152, "prefix-envscaler", EXP / "prefixes/envscaler"),
+    ("awm", "0,1", 18140, 18150, "prefix-awm", EXP / "prefixes/awm"),
+    ("envscaler", "2,3", 18142, 18152, "prefix-envscaler", EXP / "prefixes/envscaler"),
+    ("taco", "4,5", 18144, 18154, "prefix-taco", EXP / "prefixes/taco"),
+    ("base", "6,7", 18146, 18156, "base-qwen3.5-4b", Path("/home/liyu.468/models/Qwen3.5-4B")),
 )
 
 
@@ -33,16 +38,19 @@ def stop(records):
             os.killpg(pid, signal.SIGTERM)
 
 
-def main():
+def start_services():
     if STATE.exists():
         previous = json.loads(STATE.read_text())
         if any(live(item.get("pid")) for item in previous.get("services", [])):
             raise SystemExit(f"Live prefix evaluation services already recorded in {STATE}")
-    for _, _, _, _, _, model in SPECS:
-        for name in ("config.json", "prefix_merge_manifest.json"):
-            if not (model / name).is_file():
-                raise FileNotFoundError(model / name)
-    log_dir = EXP / "eval/service_logs"
+    for name, _, _, _, _, model in SPECS:
+        required = ["config.json"]
+        if name != "base":
+            required.append("prefix_merge_manifest.json")
+        for filename in required:
+            if not (model / filename).is_file():
+                raise FileNotFoundError(model / filename)
+    log_dir = EXP / "eval/service_logs_rerun"
     log_dir.mkdir(parents=True, exist_ok=True)
     services = []
     try:
@@ -108,5 +116,53 @@ def main():
         raise
 
 
+def read_services():
+    if not STATE.exists():
+        return []
+    return json.loads(STATE.read_text()).get("services", [])
+
+
+def stop_services():
+    services = read_services()
+    stop(services)
+    deadline = time.monotonic() + 60
+    while any(live(item.get("pid")) for item in services) and time.monotonic() < deadline:
+        time.sleep(1)
+    remaining = [item for item in services if live(item.get("pid"))]
+    for item in remaining:
+        os.killpg(item["pid"], signal.SIGKILL)
+    STATE.write_text(json.dumps({"stopped_at": time.time(), "services": services}, indent=2) + "\n")
+    print(json.dumps({"stopped": [item["name"] for item in services]}, indent=2))
+
+
+def status_services():
+    rows = []
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for item in read_services():
+        healthy = False
+        if live(item.get("pid")):
+            try:
+                with opener.open(f"http://127.0.0.1:{item['port']}/v1/models", timeout=2) as response:
+                    payload = json.load(response)
+                healthy = any(model["id"] == item["alias"] for model in payload["data"])
+            except OSError:
+                pass
+        rows.append({"name": item["name"], "pid": item["pid"], "gpus": item["gpus"],
+                     "port": item["port"], "alive": live(item.get("pid")), "healthy": healthy})
+    print(json.dumps(rows, indent=2))
+    return 0 if rows and all(item["healthy"] for item in rows) else 1
+
+
 if __name__ == "__main__":
-    main()
+    action = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if action == "start":
+        start_services()
+    elif action == "stop":
+        stop_services()
+    elif action == "restart":
+        stop_services()
+        start_services()
+    elif action == "status":
+        raise SystemExit(status_services())
+    else:
+        raise SystemExit("usage: eval_services.py {start|stop|restart|status}")
