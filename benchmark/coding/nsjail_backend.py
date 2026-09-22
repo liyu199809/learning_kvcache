@@ -67,6 +67,10 @@ def configuration(output, args):
     if os.geteuid() == 0:
         os.chown(output, host_uid, host_gid)
     output.chmod(0o700)
+    memory_limit_mib = memory_mib(args.code_memory)
+    scratch_limit_mib = min(memory_limit_mib, 16 * 1024)
+    shm_limit_mib = min(memory_limit_mib, 4 * 1024)
+    file_limit_mib = min(memory_limit_mib, 4 * 1024)
     lines = [
         'name: "benchmark-coding"', 'mode: ONCE', 'hostname: "code-eval"',
         'cwd: "/tmp"', f'time_limit: {args.code_eval_timeout}',
@@ -77,10 +81,10 @@ def configuration(output, args):
         'disable_no_new_privs: false', 'mount_proc: false',
         f'uidmap {{ inside_id: "{host_uid}" outside_id: "{host_uid}" count: 1 }}',
         f'gidmap {{ inside_id: "{host_gid}" outside_id: "{host_gid}" count: 1 }}',
-        f'rlimit_as: {memory_mib(args.code_memory)}', 'rlimit_core: 0',
-        f'rlimit_stack: {memory_mib(args.code_memory)}', 'rlimit_stack_type: VALUE',
-        f'rlimit_cpu: {args.code_eval_timeout}', 'rlimit_fsize: 64',
-        'rlimit_nofile: 256', 'rlimit_nproc: 64', 'rlimit_nproc_type: VALUE',
+        f'rlimit_as: {memory_limit_mib}', 'rlimit_core: 0',
+        f'rlimit_stack: {memory_limit_mib}', 'rlimit_stack_type: VALUE',
+        f'rlimit_cpu: {args.code_eval_timeout}', f'rlimit_fsize: {file_limit_mib}',
+        'rlimit_nofile: 4096', 'rlimit_nproc: 512', 'rlimit_nproc_type: VALUE',
         f'seccomp_policy_file: {json.dumps(str(POLICY))}',
     ]
     for item in ('HOME=/tmp', 'TMPDIR=/tmp', 'PATH=/opt/python/bin',
@@ -91,7 +95,7 @@ def configuration(output, args):
         lines.append(f'envar: {json.dumps(item)}')
     # EvalPlus sets AS/DATA/STACK itself. Keep its requested hard limits within
     # the jail's limits instead of letting it fail before evaluating an answer.
-    lines.append(f'envar: "EVALPLUS_MAX_MEMORY_BYTES={min(4096, memory_mib(args.code_memory)) * 1024**2}"')
+    lines.append(f'envar: "EVALPLUS_MAX_MEMORY_BYTES={memory_limit_mib * 1024**2}"')
 
     def mount(**fields):
         def encode(value):
@@ -106,8 +110,8 @@ def configuration(output, args):
         if not source.exists():
             raise RuntimeError(f'Required runtime path missing: {source}')
         mount(src=source.resolve(), dst=target, is_bind=True, rw=False, nosuid=True, nodev=True)
-    mount(dst='/tmp', fstype='tmpfs', options='size=512m,mode=1777', rw=True, nosuid=True, nodev=True)
-    mount(dst='/dev/shm', fstype='tmpfs', options='size=128m,mode=1777', rw=True, nosuid=True, nodev=True)
+    mount(dst='/tmp', fstype='tmpfs', options=f'size={scratch_limit_mib}m,mode=1777', rw=True, nosuid=True, nodev=True)
+    mount(dst='/dev/shm', fstype='tmpfs', options=f'size={shm_limit_mib}m,mode=1777', rw=True, nosuid=True, nodev=True)
     for device in ('null', 'zero', 'urandom', 'random'):
         mount(src=f'/dev/{device}', dst=f'/dev/{device}', is_bind=True, rw=True, nosuid=True)
     mount(dst='/proc', fstype='proc', rw=False, nosuid=True, nodev=True, noexec=True)

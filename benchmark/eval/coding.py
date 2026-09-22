@@ -9,8 +9,12 @@ from pathlib import Path
 
 def add_coding_args(parser):
     group = parser.add_argument_group("LiveCodeBench / EvalPlus")
-    group.add_argument("--code-thinking", choices=("on", "off"), default=None,
-                       help="Explicit chat-template thinking mode; omitted preserves server default.")
+    group.add_argument("--code-thinking", choices=("on", "off"), default="on",
+                       help="Chat-template thinking mode (default: on).")
+    group.add_argument(
+        "--code-api-timeout", type=float, default=1800.0,
+        help="Timeout for one generation request, including time queued by vLLM.",
+    )
     group.add_argument("--code-top-k", type=int, default=None)
     group.add_argument("--code-min-p", type=float, default=None)
     group.add_argument("--code-presence-penalty", type=float, default=None)

@@ -67,9 +67,10 @@ async def generate_jobs(jobs, args, path):
         max_connections=max(32, args.concurrency * 2),
         max_keepalive_connections=max(16, args.concurrency),
     )
+    api_timeout = getattr(args, "code_api_timeout", args.step_timeout)
     async with AsyncOpenAI(base_url=args.openai_base_url,
                            api_key=os.environ.get("CODE_EVAL_API_KEY", "EMPTY"),
-                           timeout=args.step_timeout, max_retries=2,
+                           timeout=api_timeout, max_retries=2,
                            http_client=httpx.AsyncClient(limits=http_limits)) as client:
         async def one(task, sample_index):
             async with semaphore:
@@ -227,7 +228,8 @@ def score_in_container(job, args):
 
 
 def main(args):
-    for name in ("concurrency", "code_n_samples", "code_eval_workers", "code_timeout", "code_eval_timeout"):
+    for name in ("concurrency", "code_n_samples", "code_eval_workers", "code_timeout",
+                 "code_eval_timeout", "code_api_timeout"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
     k = sorted({int(v) for v in args.code_pass_k.split(",")})
@@ -259,6 +261,7 @@ def main(args):
                 "model": args.model, "endpoint": args.openai_base_url,
                 "temperature": args.temperature, "top_p": args.top_p,
                 "max_tokens": args.llm_max_completion_tokens or 16384,
+                "api_timeout": args.code_api_timeout,
                 "timeout": args.code_timeout, "workers": args.code_eval_workers,
                 "base_only": False, "pass_k": k,
                 "samples_source": args.code_samples,
