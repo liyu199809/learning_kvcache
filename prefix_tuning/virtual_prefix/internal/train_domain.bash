@@ -263,10 +263,8 @@ export RAY_TMPDIR=${RAY_TMPDIR:-/tmp/kvcache-prefix-ray}
 # Separate local Ray clusters all start with job id 01000000.  A per-launch
 # namespace keeps their colocated vLLM weight-sync sockets from colliding.
 export VERL_ZMQ_NAMESPACE=${VERL_ZMQ_NAMESPACE:-$(basename -- "$RAY_TMPDIR")-$$}
-export HF_MODULES_CACHE="$EXPERIMENT_ROOT/cache/hf_modules"
-export TRITON_CACHE_DIR="$EXPERIMENT_ROOT/cache/triton"
-export VLLM_CACHE_ROOT="$EXPERIMENT_ROOT/cache/vllm"
-mkdir -p "$RAY_TMPDIR" "$HF_MODULES_CACHE" "$TRITON_CACHE_DIR" "$VLLM_CACHE_ROOT"
+# Caches (HF modules, Triton, vLLM) use their default locations.
+mkdir -p "$RAY_TMPDIR"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export WANDB_PROJECT="$PROJECT_NAME"
