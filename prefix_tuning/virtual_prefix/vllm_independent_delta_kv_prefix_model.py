@@ -21,6 +21,9 @@ else:
     from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
     _GDN_CLASS_NAME = "QwenGatedDeltaNetAttention"
 from vllm.model_executor.utils import set_weight_attrs
+from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import (
+    chunk_gated_delta_rule_pytorch,
+)
 
 
 class Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
@@ -139,7 +142,10 @@ class Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
         cu_seqlens = torch.tensor(
             [0, self.num_virtual_tokens], device=self.prefix_k.device, dtype=torch.long
         )
-        _, final_recurrent_state = self.chunk_gated_delta_rule(
+        # This short prefix-state calculation is outside the hot decode path.
+        # The vLLM-Ascend Triton kernel can fault on 910C for this TND shape;
+        # use its reference implementation for the 64 virtual prefix tokens.
+        _, final_recurrent_state = chunk_gated_delta_rule_pytorch(
             q=query,
             k=key,
             v=value,
