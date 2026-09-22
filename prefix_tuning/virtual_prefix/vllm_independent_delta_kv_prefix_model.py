@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 import torch
+
+from .cuda_runtime_compat import prefer_real_cudart_over_stubs
+
+# FLA imports TileLang on CUDA hosts. TileLang loads link-time CUDA stub
+# libraries, and vLLM 0.22 can mistake libcudart_stub.so for the real runtime.
+# Capture and protect the real runtime path before importing any GDN/FLA code.
+prefer_real_cudart_over_stubs()
+
 import torch.nn.functional as F
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
@@ -21,9 +29,25 @@ else:
     from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
     _GDN_CLASS_NAME = "QwenGatedDeltaNetAttention"
 from vllm.model_executor.utils import set_weight_attrs
-from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import (
-    chunk_gated_delta_rule_pytorch,
-)
+def _is_npu_backend() -> bool:
+    """Mirror verl.utils.device.is_npu_available for backend selection."""
+    if not hasattr(torch, "npu"):
+        return False
+    return torch.npu.is_available()
+
+
+if _is_npu_backend():
+    # Ascend NPU hosts: the vLLM-Ascend Triton kernel can fault on 910C for
+    # this TND shape, so use its reference implementation for the prefix tokens.
+    from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import (
+        chunk_gated_delta_rule_pytorch,
+    )
+else:
+    # CUDA hosts: use the FLA Triton kernel, which implements the same
+    # chunked gated-delta-rule recurrence with an identical signature.
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule as chunk_gated_delta_rule_pytorch,
+    )
 
 
 class Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
