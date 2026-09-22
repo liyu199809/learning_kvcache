@@ -163,8 +163,13 @@ class AWMAgentLoop(ToolAgentLoop):
         }
 
     def _create_sync_client(self, base_url: str):
-        """Factory seam used by CPU tests; the production path uses OpenEnv."""
-        return GenericEnvClient(base_url=base_url).sync()
+        """Create a persistent client with headroom above environment startup."""
+        return GenericEnvClient(
+            base_url=base_url,
+            connect_timeout_s=30.0,
+            message_timeout_s=90.0,
+            websocket_ping_timeout_s=300.0,
+        ).sync()
 
     @staticmethod
     def _observation(result: Any) -> dict[str, Any]:
@@ -189,22 +194,35 @@ class AWMAgentLoop(ToolAgentLoop):
         logger.warning("OpenEnv trajectory transport failure: %s", self._transport_error)
 
     async def _reset_openenv(self, env_config: dict[str, Any]) -> None:
-        try:
-            self._env_client = self._create_sync_client(env_config["base_url"])
-            result = await asyncio.to_thread(
-                self._env_client.reset,
-                scenario=env_config["scenario"],
-                task_idx=env_config["task_idx"],
-            )
-            observation = self._observation(result)
-            if observation.get("error"):
-                raise RuntimeError(observation["error"])
-            reward_type = observation.get("reward_type")
-            if reward_type not in (None, "reset_ok", "reset_warning"):
-                raise RuntimeError(f"unexpected reset reward_type={reward_type!r}: {observation}")
-            self._reset_succeeded = True
-        except Exception as exc:  # OpenEnv exposes several transport exception types.
-            self._mark_transport_failed("reset", exc)
+        last_error: BaseException | None = None
+        for attempt in range(2):
+            client = self._create_sync_client(env_config["base_url"])
+            self._env_client = client
+            try:
+                result = await asyncio.to_thread(
+                    client.reset,
+                    scenario=env_config["scenario"],
+                    task_idx=env_config["task_idx"],
+                )
+                observation = self._observation(result)
+                if observation.get("error"):
+                    raise RuntimeError(observation["error"])
+                reward_type = observation.get("reward_type")
+                if reward_type not in (None, "reset_ok", "reset_warning"):
+                    raise RuntimeError(f"unexpected reset reward_type={reward_type!r}: {observation}")
+                self._reset_succeeded = True
+                return
+            except Exception as exc:  # OpenEnv exposes several transport exception types.
+                last_error = exc
+                self._env_client = None
+                try:
+                    await asyncio.to_thread(client.close)
+                except Exception:
+                    pass
+                if attempt == 0:
+                    logger.warning("OpenEnv reset failed once; retrying with a fresh session: %s", exc)
+                    await asyncio.sleep(0.25)
+        self._mark_transport_failed("reset", last_error or "unknown reset failure")
 
     async def _call_openenv_tool(self, tool_name: str, parameters: dict[str, Any]) -> ToolResponse:
         """Forward one tool call through the trajectory's persistent session."""
