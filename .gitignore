@@ -9,6 +9,12 @@
 traj_data/*
 skills
 __pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+.vscode/
+logs/
+workspace/
+rollout_trajs/
 output
 wandb
 benchmark/eval/core/__pycache__
