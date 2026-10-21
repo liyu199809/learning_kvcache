@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Train one OPSD data view (AWM, EnvScaler, TACO, or their balanced mixture).
-# RUN_MODE=smoke runs one real optimizer step on 2 actor GPUs + 1 teacher GPU.
+# RUN_MODE=smoke runs real optimizer steps; partial mode spans three updates.
 
 set -euo pipefail
 
@@ -29,6 +29,22 @@ DATA_ROOT=${DATA_ROOT:-$EXPERIMENT_ROOT/data}
 MODEL=${MODEL:-$EXPERIMENT_ROOT/prepared/hybrid-G512-A64}
 TEACHER_MODEL=${TEACHER_MODEL:-$(dirname "$REPO_ROOT")/models/Qwen3.5-4B}
 RUN_MODE=${RUN_MODE:-full}
+TRAINER_MODE=${TRAINER_MODE:-colocate_async}
+PARTIAL_WARMUP_BATCHES=${PARTIAL_WARMUP_BATCHES:-1}
+PARTIAL_MAX_OFF_POLICY=${PARTIAL_MAX_OFF_POLICY:-8}
+PARTIAL_OFF_POLICY_STRATEGY=${PARTIAL_OFF_POLICY_STRATEGY:-wait}
+TRAINER_OVERRIDE=()
+case "$TRAINER_MODE" in
+    colocate_async)
+        TRAINER_OVERRIDE+=(trainer.use_v1=True
+            trainer.v1.trainer_mode=colocate_async
+            trainer.v1.colocate_async.num_warmup_batches="$PARTIAL_WARMUP_BATCHES"
+            trainer.v1.sampler.max_off_policy_threshold="$PARTIAL_MAX_OFF_POLICY"
+            trainer.v1.sampler.max_off_policy_strategy="$PARTIAL_OFF_POLICY_STRATEGY")
+        ;;
+    sync) TRAINER_OVERRIDE+=(trainer.use_v1=False) ;;
+    *) echo "TRAINER_MODE must be colocate_async or sync; got '$TRAINER_MODE'." >&2; exit 2 ;;
+esac
 
 case "$VIEW" in
     awm)
@@ -83,7 +99,7 @@ if [[ "$RUN_MODE" == smoke ]]; then
     TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-2}
     VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-2}
     TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
-    TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1}
+    TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-$([[ "$TRAINER_MODE" == colocate_async ]] && echo 3 || echo 1)}
     MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}
     MAX_MODEL_LEN=${MAX_MODEL_LEN:-40960}
     PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-40960}
@@ -131,12 +147,22 @@ if [[ "${USE_WANDB:-0}" == 1 ]]; then
     LOGGER_OVERRIDE='trainer.logger=["console","wandb"]'
 fi
 
+# Maintain a bounded rollout pool; train/optimizer batches are unchanged.
+# Default 4/3 over-subscription gives 32 queued prompts for train batch 24.
+PARTIAL_ROLLOUT_TARGET=${PARTIAL_ROLLOUT_TARGET:-$(((TRAIN_BATCH_SIZE * 4 + 2) / 3))}
+if [[ "$TRAINER_MODE" == colocate_async ]]; then
+    TRAINER_OVERRIDE+=(trainer.v1.colocate_async.rollout_target_size="$PARTIAL_ROLLOUT_TARGET")
+fi
+
 if [[ "$RUN_MODE" == smoke ]]; then
     DEFAULT_RUN_NAME=qwen3_5_4b_opsd_${VIEW}_smoke
 else
     DEFAULT_RUN_NAME=qwen3_5_4b_opsd_${VIEW}_1625
 fi
 RUN_NAME=${RUN_NAME:-$DEFAULT_RUN_NAME}
+if [[ "$TRAINER_MODE" == colocate_async && "$RUN_NAME" == "$DEFAULT_RUN_NAME" ]]; then
+    RUN_NAME=${RUN_NAME}_partial_pool${PARTIAL_ROLLOUT_TARGET}
+fi
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-$EXPERIMENT_ROOT/checkpoints/$RUN_NAME}
 ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-$EXPERIMENT_ROOT/rollouts/$RUN_NAME}
 
@@ -167,8 +193,24 @@ if [[ ! -f "$TEACHER_MODEL/config.json" ]]; then
     echo "Teacher model checkpoint is missing or invalid: $TEACHER_MODEL" >&2
     exit 1
 fi
-EXPECTED_PREFIX_NUMEL=$("$PYTHON_BIN" - "$MODEL/config.json" <<'PY'
-import json, sys
+EXPECTED_PREFIX_NUMEL=$("$PYTHON_BIN" - "$MODEL/config.json" "$TRAINER_MODE" "$PARTIAL_WARMUP_BATCHES" "$PARTIAL_MAX_OFF_POLICY" "$PARTIAL_OFF_POLICY_STRATEGY" "$PARTIAL_ROLLOUT_TARGET" "$TRAIN_BATCH_SIZE" <<'PY'
+import importlib.metadata
+import importlib.util
+import json
+import sys
+
+plugins = importlib.metadata.entry_points(group="vllm.general_plugins")
+if not any(p.value == "prefix_tuning.virtual_prefix.vllm_plugin:register" for p in plugins):
+    raise SystemExit(f"Hybrid prefix vLLM plugin is missing in {sys.executable}; use the kvcache environment.")
+if sys.argv[2] == "colocate_async":
+    if importlib.util.find_spec("transfer_queue") is None:
+        raise SystemExit(f"Partial rollout requires TransferQueue in {sys.executable}.")
+    if int(sys.argv[3]) < 0 or int(sys.argv[4]) <= 0:
+        raise SystemExit("PARTIAL_WARMUP_BATCHES must be >= 0 and PARTIAL_MAX_OFF_POLICY must be > 0.")
+    if sys.argv[5] not in {"wait", "drop"}:
+        raise SystemExit("PARTIAL_OFF_POLICY_STRATEGY must be wait or drop.")
+    if int(sys.argv[6]) < int(sys.argv[7]):
+        raise SystemExit("PARTIAL_ROLLOUT_TARGET must be >= TRAIN_BATCH_SIZE.")
 c = json.load(open(sys.argv[1]))["hybrid_prefix"]
 assert c["trainable_tensor_count"] == 112
 print(c["trainable_numel"])
@@ -277,6 +319,7 @@ echo "OPSD view=$VIEW mode=$RUN_MODE train=$TRAIN_ROWS val=$VAL_ROWS"
 echo "thinking=$ENABLE_THINKING turns=$MAX_ASSISTANT_TURNS/$MAX_USER_TURNS repetition_penalty=1.0"
 echo "tokens: prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH model=$MAX_MODEL_LEN"
 echo "actor GPUs=$ACTOR_GPUS teacher GPUs=$TEACHER_GPUS batch=$TRAIN_BATCH_SIZE"
+echo "trainer=$TRAINER_MODE rollout_target=$PARTIAL_ROLLOUT_TARGET max_off_policy=$PARTIAL_MAX_OFF_POLICY strategy=$PARTIAL_OFF_POLICY_STRATEGY"
 echo "optimization: lr=$ACTOR_LR rollout_temperature=$ROLLOUT_TEMPERATURE teacher_temperature=$TEACHER_TEMPERATURE rollout_eager=$ROLLOUT_ENFORCE_EAGER teacher_eager=$TEACHER_ENFORCE_EAGER"
 echo "validation: before_train=$VAL_BEFORE_TRAIN every_steps=$TEST_FREQ"
 echo "logging: $LOGGER_OVERRIDE wandb_mode=$WANDB_MODE project=$WANDB_PROJECT"
@@ -380,7 +423,7 @@ fi
     trainer.max_critic_ckpt_to_keep=3 \
     trainer.total_epochs="$TOTAL_EPOCHS" \
     trainer.resume_mode="$RESUME_MODE" \
-    trainer.use_v1=False \
+    "${TRAINER_OVERRIDE[@]}" \
     +ray_kwargs.ray_init.resources.NPU="$RAY_NPU_RESOURCES" \
     distillation.enabled=True \
     distillation.self_distillation=True \

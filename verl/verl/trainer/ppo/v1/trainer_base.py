@@ -594,17 +594,22 @@ class PPOTrainer(ABC):
             max_samples=self.config.data.get("val_max_samples", -1),
         )
 
-        # Async drop refills an arbitrary number of dropped prompts, which must divide gen_batch_size,
-        # so force gen_batch_size=1.
-        if self.trainer_mode != "sync" and self.config.trainer.v1.sampler.max_off_policy_strategy == "drop":
+        # Drop refills and bounded rollout pools can submit arbitrary prompt
+        # counts (e.g. 32 then 24, with a final 16), independently of train batch.
+        bounded_rollout = (
+            self.trainer_mode == "colocate_async"
+            and self.config.trainer.v1.colocate_async.get("rollout_target_size") is not None
+        )
+        drop_refill = self.trainer_mode != "sync" and self.config.trainer.v1.sampler.max_off_policy_strategy == "drop"
+        if bounded_rollout or drop_refill:
             user_gen_batch_size = self.config.data.get("gen_batch_size", None)
             if user_gen_batch_size not in (None, 1):
                 logger.warning(
-                    f"data.gen_batch_size={user_gen_batch_size} is overridden to 1: the async 'drop' "
-                    f"off-policy strategy refills an arbitrary number of prompts, which requires gen_batch_size=1."
+                    f"data.gen_batch_size={user_gen_batch_size} is overridden to 1: "
+                    "async prompt admission requires arbitrary refill sizes. Training batch size is unchanged."
                 )
             elif user_gen_batch_size is None:
-                logger.info("data.gen_batch_size defaulted to 1 for the async 'drop' off-policy strategy.")
+                logger.info("data.gen_batch_size defaulted to 1 for arbitrary async prompt admission.")
             with open_dict(self.config):
                 self.config.data.gen_batch_size = 1
 

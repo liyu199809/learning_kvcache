@@ -23,6 +23,10 @@ Environment overrides:
   EVAL_TEMPERATURE, EVAL_TOP_P, EVAL_CODE_TOP_K, EVAL_TAU2_CONCURRENCY
   Full training defaults: USE_WANDB=1, WANDB_MODE=online,
   VAL_BEFORE_TRAIN=True, TEST_FREQ=20
+  TRAINER_MODE=colocate_async (shared-GPU partial rollout), or sync
+  PARTIAL_ROLLOUT_TARGET defaults to 32 for TRAIN_BATCH_SIZE=24 (36 for 1.5x)
+  PARTIAL_WARMUP_BATCHES=1, PARTIAL_MAX_OFF_POLICY=8,
+  PARTIAL_OFF_POLICY_STRATEGY=wait
 EOF
 }
 

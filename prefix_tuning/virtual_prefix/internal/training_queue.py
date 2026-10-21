@@ -42,7 +42,9 @@ def atomic_json(path, value):
 
 
 def run_name(domain):
-    return f"{domain}_{GPUS_PER_JOB}gpu"
+    target = os.environ.get("PARTIAL_ROLLOUT_TARGET", "32")
+    suffix = f"_partial_pool{target}" if os.environ.get("TRAINER_MODE", "colocate_async") == "colocate_async" else ""
+    return f"{domain}_{GPUS_PER_JOB}gpu{suffix}"
 
 
 def checkpoint_dir(domain):
@@ -119,7 +121,7 @@ def export(domain):
     assert latest.name == f"global_step_{expected}", (domain, latest)
     subprocess.run([sys.executable, str(SCRIPT / "export_hybrid_delta_residual_attention_prefix_checkpoint.py"),
                     "--checkpoint", str(latest / "actor"), "--prepared-model",
-                    str(EXP / "prepared/hybrid-G512-A64"), "--output", str(EXP / "prefixes" / domain)],
+                    os.environ.get("MODEL", str(EXP / "prepared/hybrid-G512-A64")), "--output", str(EXP / "prefixes" / domain)],
                    cwd=ROOT, env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}, check=True)
 
 

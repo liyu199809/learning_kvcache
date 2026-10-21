@@ -289,7 +289,26 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             limit_key = "max_tokens"
         elif "max_new_tokens" in sampling_params:
             limit_key = "max_new_tokens"
-        original_max_tokens = sampling_params.get(limit_key) if limit_key else None
+        # Keep the request's initial budget across retries, including callers
+        # (such as ToolAgentLoop) that rely on the rollout's default length.
+        # Copy first: the same sampling parameters may be reused on later turns.
+        sampling_params = dict(sampling_params)
+        if limit_key is None:
+            rollout_config = self.config.actor_rollout_ref.rollout
+            original_max_tokens = min(
+                rollout_config.response_length,
+                rollout_config.prompt_length + rollout_config.response_length - len(prompt_ids),
+            )
+            max_model_len = rollout_config.get("max_model_len")
+            if max_model_len is not None:
+                if len(prompt_ids) >= max_model_len:
+                    raise ValueError("Prompt leaves no room to generate within max_model_len")
+                original_max_tokens = min(original_max_tokens, max_model_len - len(prompt_ids))
+            original_max_tokens = max(1, original_max_tokens)
+            limit_key = "max_tokens"
+            sampling_params[limit_key] = original_max_tokens
+        else:
+            original_max_tokens = sampling_params[limit_key]
 
         final_output = TokenOutput(
             token_ids=[],

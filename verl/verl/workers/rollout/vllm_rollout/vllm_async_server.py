@@ -171,6 +171,11 @@ class vLLMHttpServer:
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
         self._warned_missing_spec_decode_stats = False
+        # vLLM wake_up(weights) can resume scheduling before KV memory and the
+        # new weights are ready. Hold partial-rollout retries at the RPC boundary
+        # until the trainer explicitly resumes the fully restored engine.
+        self._generation_ready = asyncio.Event()
+        self._generation_ready.set()
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -545,6 +550,7 @@ class vLLMHttpServer:
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
+        await self._generation_ready.wait()
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -886,6 +892,7 @@ class vLLMHttpServer:
                 - aborted_count: Number of requests aborted
                 - request_ids: List of aborted request IDs
         """
+        self._generation_ready.clear()
         try:
             if _VLLM_VERSION >= version.parse("0.12.0"):
                 # Snapshot request IDs before pausing for reporting
@@ -937,7 +944,9 @@ class vLLMHttpServer:
 
         except Exception as e:
             logger.error(f"Error aborting requests: {e}")
-            return {"aborted_count": 0, "request_ids": [], "error": str(e)}
+            # A failed pause must stop the update, otherwise sleep may unmap
+            # memory while generation is still using it.
+            raise
 
     async def resume_generation(self):
         """Resume generation after abort_all_requests (pause_generation).
@@ -949,6 +958,7 @@ class vLLMHttpServer:
             return
         if _VLLM_VERSION >= version.parse("0.12.0"):
             await self.engine.resume_generation()
+        self._generation_ready.set()
 
     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort a specific generation request.

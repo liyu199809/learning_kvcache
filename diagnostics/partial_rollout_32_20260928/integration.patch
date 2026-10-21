@@ -1,0 +1,749 @@
+diff --git a/README.md b/README.md
+index eb2507e..b0fb574 100644
+--- a/README.md
++++ b/README.md
+@@ -21,7 +21,7 @@ Common operations:
+ # (six student GPUs and two teacher GPUs); export and compose prefixes.
+ ./experiment.sh train all
+ 
+-# Run one-domain training or a one-step smoke run.
++# Run one-domain training or a three-update partial-rollout smoke run.
+ ./experiment.sh train awm
+ ./experiment.sh train-smoke taco
+ 
+@@ -39,6 +39,58 @@ nohup ./experiment.sh eval all > outputs/formal_eval.log 2>&1 &
+ 
+ The launcher uses `outputs/prefix_composition_3domain_20260917` by default. Override it with `EXPERIMENT_ROOT` when starting a new experiment.
+ 
++Training defaults to shared-GPU partial rollout (`TRAINER_MODE=colocate_async`).
++The training batch and optimizer mini-batch remain 24. The rollout pool contains
++up to 32 prompt groups, including unfinished episodes and completed trajectories
++waiting to train. Each update consumes 24 completed, teacher-scored groups;
++the remaining 8 stay in the pool and only the missing 24 are added for the next
++update. This keeps the pool bounded instead of adding 32 fresh prompts every
++step. Near the end, new admission decreases so the final update drains the pool
++without changing the requested number of optimizer updates or training samples.
++
++`PARTIAL_ROLLOUT_TARGET` defaults to ceil(4/3 × training batch), so it is 32 for
++batch 24. Set `PARTIAL_ROLLOUT_TARGET=36` for 1.5× oversubscription. Pool size must
++be at least the training batch. Dataset fetch chunks are automatically set to
++one prompt so arbitrary refill sizes can be coalesced; training batch, epoch
++length, and optimizer step counts are unchanged. A null
++`trainer.v1.colocate_async.rollout_target_size` retains the legacy whole-batch
++warmup controlled by `PARTIAL_WARMUP_BATCHES=1`.
++
++Unfinished generations retain tokens and resume after the prefix update,
++rebuilding KV/GDN state under the new weights. The actor and rollout continue
++to share their GPUs. Retries wait until weights and KV memory are fully restored;
++each request keeps its original token budget across continuation.
++
++`PARTIAL_MAX_OFF_POLICY=8` bounds age in model versions. The default
++`PARTIAL_OFF_POLICY_STRATEGY=wait` retains old trajectories and waits for them
++at the limit rather than dropping them. An individual trajectory may span
++multiple prefix versions. Tool sessions remain live across in-process pauses;
++process restart restores actor/optimizer/dataloader state. Queue restoration
++requires TransferQueue checkpoint APIs (version >= 0.1.9); supported versions
++reissue in-flight episodes from their original prompts. The current H200
++environment has TransferQueue 0.1.7 and does not persist queued trajectories: a
++mid-run restart loses the outstanding episodes already fetched by the
++dataloader. In-process partial continuation is unaffected, and the final drain
++avoids this overhang at a normally completed run.
++
++```bash
++# Three-update smoke, to exercise cross-step continuation.
++./experiment.sh train-smoke taco
++
++# Original synchronous trainer for a controlled comparison.
++TRAINER_MODE=sync ./experiment.sh train taco
++```
++
++Default single-domain and `train all` run names end in `_partial_pool32`
++(or the chosen pool size), separating checkpoints from synchronous and older
++whole-batch warmup runs. Start a fresh run when switching dataset fetch batch
++size; the older dataloader checkpoint used a different fetch size.
++When specifying `RUN_NAME`, choose
++a fresh experiment/checkpoint directory for the first partial run. To reuse
++existing data and initialization in a new experiment, set `DATA_ROOT` and
++`MODEL` explicitly. Existing synchronous checkpoints do not contain the V1
++replay-buffer and generation state.
++
+ ## Current protocol
+ 
+ - Domains: AWM, EnvScaler, TACO.
+diff --git a/experiment.sh b/experiment.sh
+index ac8a174..c3c9455 100755
+--- a/experiment.sh
++++ b/experiment.sh
+@@ -23,6 +23,10 @@ Environment overrides:
+   EVAL_TEMPERATURE, EVAL_TOP_P, EVAL_CODE_TOP_K, EVAL_TAU2_CONCURRENCY
+   Full training defaults: USE_WANDB=1, WANDB_MODE=online,
+   VAL_BEFORE_TRAIN=True, TEST_FREQ=20
++  TRAINER_MODE=colocate_async (shared-GPU partial rollout), or sync
++  PARTIAL_ROLLOUT_TARGET defaults to 32 for TRAIN_BATCH_SIZE=24 (36 for 1.5x)
++  PARTIAL_WARMUP_BATCHES=1, PARTIAL_MAX_OFF_POLICY=8,
++  PARTIAL_OFF_POLICY_STRATEGY=wait
+ EOF
+ }
+ 
+diff --git a/prefix_tuning/virtual_prefix/internal/train_domain.bash b/prefix_tuning/virtual_prefix/internal/train_domain.bash
+index 4c8a039..1b98919 100755
+--- a/prefix_tuning/virtual_prefix/internal/train_domain.bash
++++ b/prefix_tuning/virtual_prefix/internal/train_domain.bash
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env bash
+ # Train one OPSD data view (AWM, EnvScaler, TACO, or their balanced mixture).
+-# RUN_MODE=smoke runs one real optimizer step on 2 actor GPUs + 1 teacher GPU.
++# RUN_MODE=smoke runs real optimizer steps; partial mode spans three updates.
+ 
+ set -euo pipefail
+ 
+@@ -29,6 +29,22 @@ DATA_ROOT=${DATA_ROOT:-$EXPERIMENT_ROOT/data}
+ MODEL=${MODEL:-$EXPERIMENT_ROOT/prepared/hybrid-G512-A64}
+ TEACHER_MODEL=${TEACHER_MODEL:-$(dirname "$REPO_ROOT")/models/Qwen3.5-4B}
+ RUN_MODE=${RUN_MODE:-full}
++TRAINER_MODE=${TRAINER_MODE:-colocate_async}
++PARTIAL_WARMUP_BATCHES=${PARTIAL_WARMUP_BATCHES:-1}
++PARTIAL_MAX_OFF_POLICY=${PARTIAL_MAX_OFF_POLICY:-8}
++PARTIAL_OFF_POLICY_STRATEGY=${PARTIAL_OFF_POLICY_STRATEGY:-wait}
++TRAINER_OVERRIDE=()
++case "$TRAINER_MODE" in
++    colocate_async)
++        TRAINER_OVERRIDE+=(trainer.use_v1=True
++            trainer.v1.trainer_mode=colocate_async
++            trainer.v1.colocate_async.num_warmup_batches="$PARTIAL_WARMUP_BATCHES"
++            trainer.v1.sampler.max_off_policy_threshold="$PARTIAL_MAX_OFF_POLICY"
++            trainer.v1.sampler.max_off_policy_strategy="$PARTIAL_OFF_POLICY_STRATEGY")
++        ;;
++    sync) TRAINER_OVERRIDE+=(trainer.use_v1=False) ;;
++    *) echo "TRAINER_MODE must be colocate_async or sync; got '$TRAINER_MODE'." >&2; exit 2 ;;
++esac
+ 
+ case "$VIEW" in
+     awm)
+@@ -83,7 +99,7 @@ if [[ "$RUN_MODE" == smoke ]]; then
+     TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-2}
+     VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-2}
+     TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
+-    TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1}
++    TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-$([[ "$TRAINER_MODE" == colocate_async ]] && echo 3 || echo 1)}
+     MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}
+     MAX_MODEL_LEN=${MAX_MODEL_LEN:-40960}
+     PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-40960}
+@@ -131,12 +147,22 @@ if [[ "${USE_WANDB:-0}" == 1 ]]; then
+     LOGGER_OVERRIDE='trainer.logger=["console","wandb"]'
+ fi
+ 
++# Maintain a bounded rollout pool; train/optimizer batches are unchanged.
++# Default 4/3 over-subscription gives 32 queued prompts for train batch 24.
++PARTIAL_ROLLOUT_TARGET=${PARTIAL_ROLLOUT_TARGET:-$(((TRAIN_BATCH_SIZE * 4 + 2) / 3))}
++if [[ "$TRAINER_MODE" == colocate_async ]]; then
++    TRAINER_OVERRIDE+=(trainer.v1.colocate_async.rollout_target_size="$PARTIAL_ROLLOUT_TARGET")
++fi
++
+ if [[ "$RUN_MODE" == smoke ]]; then
+     DEFAULT_RUN_NAME=qwen3_5_4b_opsd_${VIEW}_smoke
+ else
+     DEFAULT_RUN_NAME=qwen3_5_4b_opsd_${VIEW}_1625
+ fi
+ RUN_NAME=${RUN_NAME:-$DEFAULT_RUN_NAME}
++if [[ "$TRAINER_MODE" == colocate_async && "$RUN_NAME" == "$DEFAULT_RUN_NAME" ]]; then
++    RUN_NAME=${RUN_NAME}_partial_pool${PARTIAL_ROLLOUT_TARGET}
++fi
+ CHECKPOINT_DIR=${CHECKPOINT_DIR:-$EXPERIMENT_ROOT/checkpoints/$RUN_NAME}
+ ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-$EXPERIMENT_ROOT/rollouts/$RUN_NAME}
+ 
+@@ -167,8 +193,24 @@ if [[ ! -f "$TEACHER_MODEL/config.json" ]]; then
+     echo "Teacher model checkpoint is missing or invalid: $TEACHER_MODEL" >&2
+     exit 1
+ fi
+-EXPECTED_PREFIX_NUMEL=$("$PYTHON_BIN" - "$MODEL/config.json" <<'PY'
+-import json, sys
++EXPECTED_PREFIX_NUMEL=$("$PYTHON_BIN" - "$MODEL/config.json" "$TRAINER_MODE" "$PARTIAL_WARMUP_BATCHES" "$PARTIAL_MAX_OFF_POLICY" "$PARTIAL_OFF_POLICY_STRATEGY" "$PARTIAL_ROLLOUT_TARGET" "$TRAIN_BATCH_SIZE" <<'PY'
++import importlib.metadata
++import importlib.util
++import json
++import sys
++
++plugins = importlib.metadata.entry_points(group="vllm.general_plugins")
++if not any(p.value == "prefix_tuning.virtual_prefix.vllm_plugin:register" for p in plugins):
++    raise SystemExit(f"Hybrid prefix vLLM plugin is missing in {sys.executable}; use the kvcache environment.")
++if sys.argv[2] == "colocate_async":
++    if importlib.util.find_spec("transfer_queue") is None:
++        raise SystemExit(f"Partial rollout requires TransferQueue in {sys.executable}.")
++    if int(sys.argv[3]) < 0 or int(sys.argv[4]) <= 0:
++        raise SystemExit("PARTIAL_WARMUP_BATCHES must be >= 0 and PARTIAL_MAX_OFF_POLICY must be > 0.")
++    if sys.argv[5] not in {"wait", "drop"}:
++        raise SystemExit("PARTIAL_OFF_POLICY_STRATEGY must be wait or drop.")
++    if int(sys.argv[6]) < int(sys.argv[7]):
++        raise SystemExit("PARTIAL_ROLLOUT_TARGET must be >= TRAIN_BATCH_SIZE.")
+ c = json.load(open(sys.argv[1]))["hybrid_prefix"]
+ assert c["trainable_tensor_count"] == 112
+ print(c["trainable_numel"])
+@@ -277,6 +319,7 @@ echo "OPSD view=$VIEW mode=$RUN_MODE train=$TRAIN_ROWS val=$VAL_ROWS"
+ echo "thinking=$ENABLE_THINKING turns=$MAX_ASSISTANT_TURNS/$MAX_USER_TURNS repetition_penalty=1.0"
+ echo "tokens: prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH model=$MAX_MODEL_LEN"
+ echo "actor GPUs=$ACTOR_GPUS teacher GPUs=$TEACHER_GPUS batch=$TRAIN_BATCH_SIZE"
++echo "trainer=$TRAINER_MODE rollout_target=$PARTIAL_ROLLOUT_TARGET max_off_policy=$PARTIAL_MAX_OFF_POLICY strategy=$PARTIAL_OFF_POLICY_STRATEGY"
+ echo "optimization: lr=$ACTOR_LR rollout_temperature=$ROLLOUT_TEMPERATURE teacher_temperature=$TEACHER_TEMPERATURE rollout_eager=$ROLLOUT_ENFORCE_EAGER teacher_eager=$TEACHER_ENFORCE_EAGER"
+ echo "validation: before_train=$VAL_BEFORE_TRAIN every_steps=$TEST_FREQ"
+ echo "logging: $LOGGER_OVERRIDE wandb_mode=$WANDB_MODE project=$WANDB_PROJECT"
+@@ -380,7 +423,7 @@ fi
+     trainer.max_critic_ckpt_to_keep=3 \
+     trainer.total_epochs="$TOTAL_EPOCHS" \
+     trainer.resume_mode="$RESUME_MODE" \
+-    trainer.use_v1=False \
++    "${TRAINER_OVERRIDE[@]}" \
+     +ray_kwargs.ray_init.resources.NPU="$RAY_NPU_RESOURCES" \
+     distillation.enabled=True \
+     distillation.self_distillation=True \
+diff --git a/prefix_tuning/virtual_prefix/internal/training_queue.py b/prefix_tuning/virtual_prefix/internal/training_queue.py
+index 63a6c02..2ff99a7 100644
+--- a/prefix_tuning/virtual_prefix/internal/training_queue.py
++++ b/prefix_tuning/virtual_prefix/internal/training_queue.py
+@@ -42,7 +42,9 @@ def atomic_json(path, value):
+ 
+ 
+ def run_name(domain):
+-    return f"{domain}_{GPUS_PER_JOB}gpu"
++    target = os.environ.get("PARTIAL_ROLLOUT_TARGET", "32")
++    suffix = f"_partial_pool{target}" if os.environ.get("TRAINER_MODE", "colocate_async") == "colocate_async" else ""
++    return f"{domain}_{GPUS_PER_JOB}gpu{suffix}"
+ 
+ 
+ def checkpoint_dir(domain):
+@@ -119,7 +121,7 @@ def export(domain):
+     assert latest.name == f"global_step_{expected}", (domain, latest)
+     subprocess.run([sys.executable, str(SCRIPT / "export_hybrid_delta_residual_attention_prefix_checkpoint.py"),
+                     "--checkpoint", str(latest / "actor"), "--prepared-model",
+-                    str(EXP / "prepared/hybrid-G512-A64"), "--output", str(EXP / "prefixes" / domain)],
++                    os.environ.get("MODEL", str(EXP / "prepared/hybrid-G512-A64")), "--output", str(EXP / "prefixes" / domain)],
+                    cwd=ROOT, env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}, check=True)
+ 
+ 
+diff --git a/verl/verl/trainer/config/ppo_trainer.yaml b/verl/verl/trainer/config/ppo_trainer.yaml
+index b913529..d3384c1 100644
+--- a/verl/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/verl/trainer/config/ppo_trainer.yaml
+@@ -212,6 +212,10 @@ trainer:
+     # Asynchronous PPO trainer with colocated trainer and rollout
+     colocate_async:
+ 
++      # Total queued prompt groups (unfinished and completed); refill to this
++      # target without changing data.train_batch_size. Null uses batch warmup.
++      rollout_target_size: null
++
+       # Number of warmup batches to add before training loop starts
+       num_warmup_batches: 1
+ 
+diff --git a/verl/verl/trainer/ppo/v1/trainer_base.py b/verl/verl/trainer/ppo/v1/trainer_base.py
+index f754e04..4ca8ceb 100644
+--- a/verl/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/verl/trainer/ppo/v1/trainer_base.py
+@@ -594,17 +594,22 @@ class PPOTrainer(ABC):
+             max_samples=self.config.data.get("val_max_samples", -1),
+         )
+ 
+-        # Async drop refills an arbitrary number of dropped prompts, which must divide gen_batch_size,
+-        # so force gen_batch_size=1.
+-        if self.trainer_mode != "sync" and self.config.trainer.v1.sampler.max_off_policy_strategy == "drop":
++        # Drop refills and bounded rollout pools can submit arbitrary prompt
++        # counts (e.g. 32 then 24, with a final 16), independently of train batch.
++        bounded_rollout = (
++            self.trainer_mode == "colocate_async"
++            and self.config.trainer.v1.colocate_async.get("rollout_target_size") is not None
++        )
++        drop_refill = self.trainer_mode != "sync" and self.config.trainer.v1.sampler.max_off_policy_strategy == "drop"
++        if bounded_rollout or drop_refill:
+             user_gen_batch_size = self.config.data.get("gen_batch_size", None)
+             if user_gen_batch_size not in (None, 1):
+                 logger.warning(
+-                    f"data.gen_batch_size={user_gen_batch_size} is overridden to 1: the async 'drop' "
+-                    f"off-policy strategy refills an arbitrary number of prompts, which requires gen_batch_size=1."
++                    f"data.gen_batch_size={user_gen_batch_size} is overridden to 1: "
++                    "async prompt admission requires arbitrary refill sizes. Training batch size is unchanged."
+                 )
+             elif user_gen_batch_size is None:
+-                logger.info("data.gen_batch_size defaulted to 1 for the async 'drop' off-policy strategy.")
++                logger.info("data.gen_batch_size defaulted to 1 for arbitrary async prompt admission.")
+             with open_dict(self.config):
+                 self.config.data.gen_batch_size = 1
+ 
+diff --git a/verl/verl/trainer/ppo/v1/trainer_colocate_async.py b/verl/verl/trainer/ppo/v1/trainer_colocate_async.py
+index 12e31a3..39a2306 100644
+--- a/verl/verl/trainer/ppo/v1/trainer_colocate_async.py
++++ b/verl/verl/trainer/ppo/v1/trainer_colocate_async.py
+@@ -14,6 +14,8 @@
+ import logging
+ import os
+ 
++import transfer_queue as tq
++
+ from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
+ from verl.utils.debug import marked_timer
+ from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
+@@ -40,11 +42,70 @@ class PPOTrainerColocateAsync(PPOTrainer):
+     def on_train_begin(self):
+         if self.config.skip.rollout_tq.enable:
+             return
+-        num_warmup_batches = self.config.trainer.v1.colocate_async.num_warmup_batches
++        self._rollout_target_size = self.config.trainer.v1.colocate_async.get("rollout_target_size")
++        if self._rollout_target_size is not None:
++            if not isinstance(self._rollout_target_size, int) or self._rollout_target_size < self.config.data.train_batch_size:
++                raise ValueError("rollout_target_size must be an integer >= data.train_batch_size")
++            remaining_updates = max(0, self.total_training_steps - self.global_steps + 1)
++            self._remaining_feed_prompts = max(
++                0, remaining_updates * self.config.data.train_batch_size - self._queued_prompt_groups()
++            )
++            logger.info(
++                f"Bounded rollout pool: target={self._rollout_target_size}, "
++                f"train_batch={self.config.data.train_batch_size}, admission_budget={self._remaining_feed_prompts}"
++            )
++            return
++        # Warmup brings prompts forward; it must not add extra prompts beyond
++        # the requested updates. Account for checkpointed groups and stop feeding
++        # new batches near the end, so the last updates drain the existing tails.
++        items = (tq.kv_list("train") or {}).get("train", {})
++        existing_groups = sum(tag.get("is_prompt", False) for tag in items.values())
++        remaining_updates = max(0, self.total_training_steps - self.global_steps + 1)
++        self._remaining_feed_batches = max(
++            0, remaining_updates - existing_groups // self.config.data.train_batch_size
++        )
++        num_warmup_batches = min(
++            self.config.trainer.v1.colocate_async.num_warmup_batches, self._remaining_feed_batches
++        )
+         for _ in range(num_warmup_batches):
+             self._add_batch_to_generate()
+         logger.info(f"Added {num_warmup_batches} warmup batches to the agent loop manager")
+ 
++    def _add_batch_to_generate(self):
++        if getattr(self, "_rollout_target_size", None) is not None:
++            self._last_queued_before = self._queued_prompt_groups()
++            self._last_feed_count = min(
++                max(0, self._rollout_target_size - self._last_queued_before), self._remaining_feed_prompts
++            )
++            if self._last_feed_count:
++                submitted = self._add_prompts_to_generate(self._last_feed_count)
++                self._remaining_feed_prompts -= submitted
++                self._last_feed_count = submitted
++            return
++        remaining = getattr(self, "_remaining_feed_batches", None)
++        if remaining is not None and remaining <= 0:
++            return
++        super()._add_batch_to_generate()
++        if remaining is not None:
++            self._remaining_feed_batches -= 1
++
++    def _queued_prompt_groups(self):
++        items = (tq.kv_list("train") or {}).get("train", {})
++        return sum(tag.get("is_prompt", False) for tag in items.values())
++
++    def step(self, metrics, timing_raw):
++        batch = super().step(metrics, timing_raw)
++        if getattr(self, "_rollout_target_size", None) is not None:
++            queued = self._queued_prompt_groups()
++            metrics.update({
++                "training/partial/rollout_target": self._rollout_target_size,
++                "training/partial/submitted_prompts": self._last_feed_count,
++                "training/partial/consumed_prompts": self._last_queued_before + self._last_feed_count - queued,
++                "training/partial/queued_prompts": queued,
++                "training/partial/remaining_admission_budget": self._remaining_feed_prompts,
++            })
++        return batch
++
+     def on_step_end(self):
+         with marked_timer("update_weights", self.timing_raw, color="red"):
+             # wake up all replicas to update weights
+diff --git a/verl/verl/workers/rollout/llm_server.py b/verl/verl/workers/rollout/llm_server.py
+index 949b960..ae93e73 100644
+--- a/verl/verl/workers/rollout/llm_server.py
++++ b/verl/verl/workers/rollout/llm_server.py
+@@ -289,7 +289,26 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+             limit_key = "max_tokens"
+         elif "max_new_tokens" in sampling_params:
+             limit_key = "max_new_tokens"
+-        original_max_tokens = sampling_params.get(limit_key) if limit_key else None
++        # Keep the request's initial budget across retries, including callers
++        # (such as ToolAgentLoop) that rely on the rollout's default length.
++        # Copy first: the same sampling parameters may be reused on later turns.
++        sampling_params = dict(sampling_params)
++        if limit_key is None:
++            rollout_config = self.config.actor_rollout_ref.rollout
++            original_max_tokens = min(
++                rollout_config.response_length,
++                rollout_config.prompt_length + rollout_config.response_length - len(prompt_ids),
++            )
++            max_model_len = rollout_config.get("max_model_len")
++            if max_model_len is not None:
++                if len(prompt_ids) >= max_model_len:
++                    raise ValueError("Prompt leaves no room to generate within max_model_len")
++                original_max_tokens = min(original_max_tokens, max_model_len - len(prompt_ids))
++            original_max_tokens = max(1, original_max_tokens)
++            limit_key = "max_tokens"
++            sampling_params[limit_key] = original_max_tokens
++        else:
++            original_max_tokens = sampling_params[limit_key]
+ 
+         final_output = TokenOutput(
+             token_ids=[],
+diff --git a/verl/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 4e0966a..82a386f 100644
+--- a/verl/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -171,6 +171,11 @@ class vLLMHttpServer:
+         # model weights version, set by ServerAdapter when update weights.
+         self.global_steps = None
+         self._warned_missing_spec_decode_stats = False
++        # vLLM wake_up(weights) can resume scheduling before KV memory and the
++        # new weights are ready. Hold partial-rollout retries at the RPC boundary
++        # until the trainer explicitly resumes the fully restored engine.
++        self._generation_ready = asyncio.Event()
++        self._generation_ready.set()
+ 
+         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
+             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
+@@ -545,6 +550,7 @@ class vLLMHttpServer:
+         Args:
+             kv_transfer_params: vLLM KV-transfer payload for PD requests.
+         """
++        await self._generation_ready.wait()
+         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
+             return await self._pd_dispatch(
+                 prompt_ids,
+@@ -886,6 +892,7 @@ class vLLMHttpServer:
+                 - aborted_count: Number of requests aborted
+                 - request_ids: List of aborted request IDs
+         """
++        self._generation_ready.clear()
+         try:
+             if _VLLM_VERSION >= version.parse("0.12.0"):
+                 # Snapshot request IDs before pausing for reporting
+@@ -937,7 +944,9 @@ class vLLMHttpServer:
+ 
+         except Exception as e:
+             logger.error(f"Error aborting requests: {e}")
+-            return {"aborted_count": 0, "request_ids": [], "error": str(e)}
++            # A failed pause must stop the update, otherwise sleep may unmap
++            # memory while generation is still using it.
++            raise
+ 
+     async def resume_generation(self):
+         """Resume generation after abort_all_requests (pause_generation).
+@@ -949,6 +958,7 @@ class vLLMHttpServer:
+             return
+         if _VLLM_VERSION >= version.parse("0.12.0"):
+             await self.engine.resume_generation()
++        self._generation_ready.set()
+ 
+     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+         """Abort a specific generation request.
+diff --git a/prefix_tuning/tests/test_partial_rollout_client.py b/prefix_tuning/tests/test_partial_rollout_client.py
+new file mode 100644
+index 0000000..6439a86
+--- /dev/null
++++ b/prefix_tuning/tests/test_partial_rollout_client.py
+@@ -0,0 +1,305 @@
++"""Exercise the abort/resume contract used by hybrid-prefix OPSD."""
++import asyncio
++from unittest.mock import AsyncMock
++
++import pytest
++from omegaconf import OmegaConf
++
++from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerClient
++from verl.workers.rollout.replica import TokenOutput
++
++
++def test_resume_keeps_tokens_logprobs_and_remaining_budget(monkeypatch):
++    replies = iter([
++        TokenOutput(token_ids=[10, 11], log_probs=[-.2, -.3], stop_reason="aborted",
++                    extra_fields={"global_steps": 1}),
++        TokenOutput(token_ids=[12], log_probs=[-.4], stop_reason="stop",
++                    extra_fields={"global_steps": 2}),
++    ])
++    requests = []
++
++    async def generate(self, request_id, **kwargs):
++        requests.append((request_id, list(kwargs["prompt_ids"]), dict(kwargs["sampling_params"])))
++        return next(replies)
++
++    monkeypatch.setattr(LLMServerClient, "generate", generate)
++    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
++    client = object.__new__(FullyAsyncLLMServerClient)
++    client.config = OmegaConf.create({"trainer": {"use_v1": True}})
++    out = asyncio.run(client.generate("episode-1", prompt_ids=[1, 2],
++                                    sampling_params={"max_tokens": 5}))
++    assert out.token_ids == [10, 11, 12]
++    assert out.log_probs == [-.2, -.3, -.4]
++    assert requests == [("episode-1", [1, 2], {"max_tokens": 5}),
++                        ("episode-1", [1, 2, 10, 11], {"max_tokens": 3})]
++    assert out.extra_fields["min_global_steps"] == 1
++    assert out.extra_fields["max_global_steps"] == 2
++    assert out.stop_reason == "stop"
++
++
++def test_resume_stops_at_original_token_limit(monkeypatch):
++    calls = []
++
++    async def generate(self, request_id, **kwargs):
++        calls.append(kwargs["sampling_params"]["max_new_tokens"])
++        return TokenOutput(token_ids=[10, 11], log_probs=[-.2, -.3],
++                           stop_reason="aborted", extra_fields={"global_steps": 1})
++
++    monkeypatch.setattr(LLMServerClient, "generate", generate)
++    client = object.__new__(FullyAsyncLLMServerClient)
++    client.config = OmegaConf.create({"trainer": {"use_v1": True}})
++    out = asyncio.run(client.generate("episode-2", prompt_ids=[1],
++                                    sampling_params={"max_new_tokens": 2}))
++    assert calls == [2]
++    assert out.token_ids == [10, 11]
++    assert out.stop_reason == "length"
++
++
++def test_wait_strategy_allows_a_tail_until_version_limit():
++    from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
++
++    buffer = ReplayBuffer("colocate_async", OmegaConf.create({}), 8, "wait", OmegaConf.create({}))
++    buffer.running_keys["train"].add("long")
++    buffer.prompt_global_steps["train"]["long"] = 1
++    buffer.finished_keys["train"].update({"ready-a", "ready-b"})
++    buffer.prompt_global_steps["train"].update({"ready-a": 1, "ready-b": 2})
++    assert buffer._has_enough_samples(2, "train", 2)
++    assert not buffer._has_enough_samples(8, "train", 2)
++    buffer.running_keys["train"].clear()
++    buffer.finished_keys["train"].add("long")
++    assert buffer._has_enough_samples(8, "train", 2)
++    assert "long" in buffer._sampleable_terminal_keys(8, "train")
++
++
++def test_server_holds_retries_across_staged_wake_up():
++    from types import SimpleNamespace
++    from verl.workers.rollout.replica import RolloutMode
++    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
++
++    impl = getattr(getattr(vLLMHttpServer, "__ray_metadata__", None), "modified_class", vLLMHttpServer)
++
++    async def scenario():
++        server = object.__new__(impl)
++        server._generation_ready = asyncio.Event()
++        server._generation_ready.set()
++        server.node_rank = 0
++        server.replica_rank = 0
++        server.rollout_mode = RolloutMode.HYBRID
++        server._disaggregation_role = "null"
++        server.global_steps = 1
++        server.config = OmegaConf.create({"max_model_len": 32, "full_determinism": False})
++        server.model_config = SimpleNamespace(processor=None, lora_rank=0, lora={})
++        state = {"weights": False, "kv_cache": False, "entered": False}
++
++        async def wake_up(tags):
++            for tag in tags:
++                state[tag] = True
++            # Current vLLM also resumes its scheduler here, before staged sync ends.
++
++        async def generate(**kwargs):
++            assert state["weights"] and state["kv_cache"]
++            state["entered"] = True
++            yield SimpleNamespace(outputs=[])
++
++        server.engine = SimpleNamespace(
++            output_processor=SimpleNamespace(request_states={}),
++            pause_generation=AsyncMock(), resume_generation=AsyncMock(),
++            wake_up=wake_up, reset_prefix_cache=AsyncMock(), generate=generate,
++        )
++        await server.abort_all_requests()
++        retry = asyncio.create_task(server.generate([1], {"max_tokens": 1}, "tail"))
++        await asyncio.sleep(0)
++        await server.wake_up(tags=["weights"])
++        await asyncio.sleep(0)
++        assert not state["entered"]
++        assert not retry.done()
++        await server.wake_up(tags=["kv_cache"])
++        server.global_steps = 2
++        await server.resume_generation()
++        out = await asyncio.wait_for(retry, timeout=1)
++        assert state["entered"]
++        assert out.extra_fields["global_steps"] == 2
++
++    asyncio.run(scenario())
++
++
++def test_server_pause_failure_stops_the_update():
++    from types import SimpleNamespace
++    import pytest
++    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
++
++    impl = getattr(getattr(vLLMHttpServer, "__ray_metadata__", None), "modified_class", vLLMHttpServer)
++
++    async def scenario():
++        server = object.__new__(impl)
++        server._generation_ready = asyncio.Event()
++        server._generation_ready.set()
++        server.engine = SimpleNamespace(
++            output_processor=SimpleNamespace(request_states={}),
++            pause_generation=AsyncMock(side_effect=RuntimeError("pause failed")),
++        )
++        with pytest.raises(RuntimeError, match="pause failed"):
++            await server.abort_all_requests()
++        assert not server._generation_ready.is_set()
++
++    asyncio.run(scenario())
++
++
++@pytest.mark.parametrize("max_model_len,expected_budgets", [(32, [5, 3]), (5, [3, 1])])
++def test_resume_uses_default_request_budget_without_mutating_caller(monkeypatch, max_model_len, expected_budgets):
++    replies = iter([
++        TokenOutput(token_ids=[10, 11], log_probs=[-.2, -.3], stop_reason="aborted",
++                    extra_fields={"global_steps": 1}),
++        TokenOutput(token_ids=[12], log_probs=[-.4], stop_reason="stop",
++                    extra_fields={"global_steps": 2}),
++    ])
++    budgets = []
++
++    async def generate(self, request_id, **kwargs):
++        budgets.append(kwargs["sampling_params"]["max_tokens"])
++        return next(replies)
++
++    monkeypatch.setattr(LLMServerClient, "generate", generate)
++    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
++    client = object.__new__(FullyAsyncLLMServerClient)
++    client.config = OmegaConf.create({"trainer": {"use_v1": True}, "actor_rollout_ref": {
++        "rollout": {"response_length": 5, "prompt_length": 10, "max_model_len": max_model_len}}})
++    sampling_params = {"temperature": 1.0}
++    out = asyncio.run(client.generate("default-budget", prompt_ids=[1, 2],
++                                    sampling_params=sampling_params))
++    assert budgets == expected_budgets
++    assert out.token_ids == [10, 11, 12]
++    assert sampling_params == {"temperature": 1.0}
++
++
++@pytest.mark.parametrize("start_step,existing_groups,expected_new_groups", [(1, 0, 6), (2, 2, 2)])
++def test_colocate_warmup_is_drained_within_requested_updates(monkeypatch, start_step, existing_groups, expected_new_groups):
++    from verl.trainer.ppo.v1 import trainer_colocate_async as module
++    from verl.trainer.ppo.v1.trainer_base import PPOTrainer
++
++    trainer = object.__new__(module.PPOTrainerColocateAsync)
++    trainer.config = OmegaConf.create({"skip": {"rollout_tq": {"enable": False}},
++        "data": {"train_batch_size": 2},
++        "trainer": {"v1": {"colocate_async": {"num_warmup_batches": 1}}}})
++    trainer.total_training_steps = 3
++    trainer.global_steps = start_step
++    submitted = []
++    items = {str(i): {"is_prompt": True, "status": "running"} for i in range(existing_groups)}
++    monkeypatch.setattr(module.tq, "kv_list", lambda partition: {partition: items})
++    monkeypatch.setattr(PPOTrainer, "_add_batch_to_generate", lambda self: submitted.extend([None, None]))
++    trainer.on_train_begin()
++    for _ in range(3 - start_step + 1):
++        trainer._add_batch_to_generate()
++    assert len(submitted) == expected_new_groups
++    assert len(submitted) + existing_groups == (3 - start_step + 1) * 2
++    assert trainer._remaining_feed_batches == 0
++
++
++@pytest.mark.parametrize("target,existing,steps,expected_feeds", [
++    (32, 0, 4, [32, 24, 24, 16]),
++    (36, 0, 4, [36, 24, 24, 12]),
++    (32, 0, 1, [24]),
++    (32, 8, 2, [24, 16]),
++    (32, 5, 2, [27, 16]),
++    (32, 48, 3, [0, 8, 16]),
++])
++def test_bounded_pool_trains_24_and_drains_without_accumulation(monkeypatch, target, existing, steps, expected_feeds):
++    from types import MethodType, SimpleNamespace
++    from verl.trainer.ppo.v1 import trainer_colocate_async as module
++
++    trainer = object.__new__(module.PPOTrainerColocateAsync)
++    trainer.config = OmegaConf.create({"skip": {"rollout_tq": {"enable": False}},
++        "data": {"train_batch_size": 24},
++        "trainer": {"v1": {"colocate_async": {"num_warmup_batches": 1, "rollout_target_size": target}}}})
++    trainer.total_training_steps = steps
++    trainer.global_steps = 1
++    trainer.parameter_sync_step = 1
++    items = {f"restored-{i}": {"is_prompt": True} for i in range(existing)}
++    # Trajectory keys do not count against the pool of prompt groups.
++    items["trajectory"] = {"is_prompt": False}
++    submitted = []
++    counter = iter(range(1000))
++    monkeypatch.setattr(module.tq, "kv_list", lambda partition: {partition: dict(items)})
++
++    def add(self, count):
++        submitted.extend(range(count))
++        for _ in range(count):
++            items[f"new-{next(counter)}"] = {"is_prompt": True}
++        return count
++
++    def train_once(self, metrics, timing, batch_size):
++        assert batch_size == 24
++        # Consume recently completed samples first to leave initial long tails
++        # in the pool until the final drain, exercising out-of-order completion.
++        keys = [k for k, tag in items.items() if tag.get("is_prompt")][-batch_size:]
++        assert len(keys) == 24
++        for key in keys:
++            del items[key]
++        return SimpleNamespace(keys=keys, tags=[{} for _ in keys], partition_id="train")
++
++    trainer._add_prompts_to_generate = MethodType(add, trainer)
++    trainer._step_once = MethodType(train_once, trainer)
++    trainer.on_train_begin()
++    assert not submitted  # Pool admission is measured inside step/feed.
++    for step, expected in enumerate(expected_feeds, 1):
++        trainer.global_steps = step
++        metrics = {}
++        batch = trainer.step(metrics, {})
++        assert len(batch.keys) == 24
++        assert metrics["training/partial/submitted_prompts"] == expected
++        assert metrics["training/partial/consumed_prompts"] == 24
++        assert metrics["training/partial/queued_prompts"] <= max(target - 24, existing - 24)
++    assert trainer._queued_prompt_groups() == 0
++    assert trainer._remaining_feed_prompts == 0
++    assert len(submitted) + existing == steps * 24
++
++
++def test_bounded_pool_can_coalesce_32_then_24_without_changing_train_batch():
++    import torch
++    from tensordict import TensorDict
++    from verl.trainer.ppo.v1.trainer_colocate_async import PPOTrainerColocateAsync
++
++    trainer = object.__new__(PPOTrainerColocateAsync)
++    trainer.config = OmegaConf.create({"data": {"train_batch_size": 24, "gen_batch_size": 1}})
++    trainer.global_steps = 1
++    counter = iter(range(56))
++    trainer._fetch_one_gen_batch = lambda: TensorDict({"index": torch.tensor([next(counter)])}, batch_size=[1])
++    first = trainer._next_train_batch(32)
++    refill = trainer._next_train_batch(24)
++    assert len(first) == 32 and len(refill) == 24
++    assert first["index"].tolist() == list(range(32))
++    assert refill["index"].tolist() == list(range(32, 56))
++    assert trainer.config.data.train_batch_size == 24
++
++
++def test_bounded_pool_fetch_size_does_not_change_epoch_or_optimizer_steps(monkeypatch):
++    from verl.trainer.ppo.v1 import trainer_base as base
++    from verl.trainer.ppo.v1.trainer_colocate_async import PPOTrainerColocateAsync
++
++    trainer = object.__new__(PPOTrainerColocateAsync)
++    trainer.config = OmegaConf.create({
++        "data": {"train_batch_size": 24, "gen_batch_size": 8, "train_files": [], "val_files": [],
++                 "val_batch_size": 2, "dataloader_num_workers": 0},
++        "trainer": {"total_epochs": 1, "total_training_steps": None,
++                    "v1": {"colocate_async": {"rollout_target_size": 32},
++                           "sampler": {"max_off_policy_strategy": "wait"}}}})
++    trainer.trainer_mode = "colocate_async"
++    trainer.parameter_sync_step = 1
++    trainer.tokenizer = trainer.processor = None
++    monkeypatch.setattr(base, "create_rl_dataset", lambda *args, is_train, **kwargs: [{}] * (96 if is_train else 2))
++    monkeypatch.setattr(base, "create_rl_sampler", lambda *args: None)
++    trainer._init_dataloader()
++    assert trainer.train_dataloader.batch_size == 1
++    assert trainer.config.data.train_batch_size == 24
++    assert trainer.steps_per_epoch == 4 and trainer.total_training_steps == 4
++
++
++def test_bounded_pool_rejects_target_smaller_than_training_batch():
++    from verl.trainer.ppo.v1.trainer_colocate_async import PPOTrainerColocateAsync
++
++    trainer = object.__new__(PPOTrainerColocateAsync)
++    trainer.config = OmegaConf.create({"skip": {"rollout_tq": {"enable": False}},
++        "data": {"train_batch_size": 24},
++        "trainer": {"v1": {"colocate_async": {"rollout_target_size": 23}}}})
++    with pytest.raises(ValueError, match="data.train_batch_size"):
++        trainer.on_train_begin()

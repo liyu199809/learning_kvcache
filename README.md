@@ -21,7 +21,7 @@ Common operations:
 # (six student GPUs and two teacher GPUs); export and compose prefixes.
 ./experiment.sh train all
 
-# Run one-domain training or a one-step smoke run.
+# Run one-domain training or a three-update partial-rollout smoke run.
 ./experiment.sh train awm
 ./experiment.sh train-smoke taco
 
@@ -38,6 +38,58 @@ nohup ./experiment.sh eval all > outputs/formal_eval.log 2>&1 &
 ```
 
 The launcher uses `outputs/prefix_composition_3domain_20260917` by default. Override it with `EXPERIMENT_ROOT` when starting a new experiment.
+
+Training defaults to shared-GPU partial rollout (`TRAINER_MODE=colocate_async`).
+The training batch and optimizer mini-batch remain 24. The rollout pool contains
+up to 32 prompt groups, including unfinished episodes and completed trajectories
+waiting to train. Each update consumes 24 completed, teacher-scored groups;
+the remaining 8 stay in the pool and only the missing 24 are added for the next
+update. This keeps the pool bounded instead of adding 32 fresh prompts every
+step. Near the end, new admission decreases so the final update drains the pool
+without changing the requested number of optimizer updates or training samples.
+
+`PARTIAL_ROLLOUT_TARGET` defaults to ceil(4/3 × training batch), so it is 32 for
+batch 24. Set `PARTIAL_ROLLOUT_TARGET=36` for 1.5× oversubscription. Pool size must
+be at least the training batch. Dataset fetch chunks are automatically set to
+one prompt so arbitrary refill sizes can be coalesced; training batch, epoch
+length, and optimizer step counts are unchanged. A null
+`trainer.v1.colocate_async.rollout_target_size` retains the legacy whole-batch
+warmup controlled by `PARTIAL_WARMUP_BATCHES=1`.
+
+Unfinished generations retain tokens and resume after the prefix update,
+rebuilding KV/GDN state under the new weights. The actor and rollout continue
+to share their GPUs. Retries wait until weights and KV memory are fully restored;
+each request keeps its original token budget across continuation.
+
+`PARTIAL_MAX_OFF_POLICY=8` bounds age in model versions. The default
+`PARTIAL_OFF_POLICY_STRATEGY=wait` retains old trajectories and waits for them
+at the limit rather than dropping them. An individual trajectory may span
+multiple prefix versions. Tool sessions remain live across in-process pauses;
+process restart restores actor/optimizer/dataloader state. Queue restoration
+requires TransferQueue checkpoint APIs (version >= 0.1.9); supported versions
+reissue in-flight episodes from their original prompts. The current H200
+environment has TransferQueue 0.1.7 and does not persist queued trajectories: a
+mid-run restart loses the outstanding episodes already fetched by the
+dataloader. In-process partial continuation is unaffected, and the final drain
+avoids this overhang at a normally completed run.
+
+```bash
+# Three-update smoke, to exercise cross-step continuation.
+./experiment.sh train-smoke taco
+
+# Original synchronous trainer for a controlled comparison.
+TRAINER_MODE=sync ./experiment.sh train taco
+```
+
+Default single-domain and `train all` run names end in `_partial_pool32`
+(or the chosen pool size), separating checkpoints from synchronous and older
+whole-batch warmup runs. Start a fresh run when switching dataset fetch batch
+size; the older dataloader checkpoint used a different fetch size.
+When specifying `RUN_NAME`, choose
+a fresh experiment/checkpoint directory for the first partial run. To reuse
+existing data and initialization in a new experiment, set `DATA_ROOT` and
+`MODEL` explicitly. Existing synchronous checkpoints do not contain the V1
+replay-buffer and generation state.
 
 ## Current protocol
 

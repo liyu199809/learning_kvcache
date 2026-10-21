@@ -212,6 +212,10 @@ trainer:
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 
+      # Total queued prompt groups (unfinished and completed); refill to this
+      # target without changing data.train_batch_size. Null uses batch warmup.
+      rollout_target_size: null
+
       # Number of warmup batches to add before training loop starts
       num_warmup_batches: 1
 
