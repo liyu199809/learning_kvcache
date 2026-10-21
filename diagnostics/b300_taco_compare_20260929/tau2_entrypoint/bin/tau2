@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+"""Use the existing B300 Python and already installed tau2 dependencies."""
+import site
+import sys
+existing = '/home/liyu.468/learning_kvcache/benchmark/tau2/.venv/lib/python3.12/site-packages'
+site.addsitedir(existing)
+sys.path.remove(existing)
+sys.path.insert(0, existing)
+from tau2.cli import main
+if __name__ == '__main__':
+    sys.exit(main())

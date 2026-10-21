@@ -1,0 +1,13 @@
+#!/usr/bin/python3
+"""Launch a tau2 script using existing Python 3.12 and installed dependencies."""
+import runpy
+import site
+import sys
+existing = '/home/liyu.468/learning_kvcache/benchmark/tau2/.venv/lib/python3.12/site-packages'
+site.addsitedir(existing)
+sys.path.remove(existing)
+sys.path.insert(0, existing)
+sys.argv = sys.argv[1:]
+if not sys.argv or not sys.argv[0].endswith('.py'):
+    raise SystemExit('This entrypoint supports only the existing tau2 Python scripts')
+runpy.run_path(sys.argv[0], run_name='__main__')
