@@ -240,6 +240,15 @@ def distillation_loss(
     - distillation_loss: Aggregated distillation loss scalar.
     - distillation_metrics: Dictionary of metrics.
     """
+    # Distillation is evaluated before ppo_loss, and pure distillation skips
+    # ppo_loss entirely. Refresh the global denominators here so accumulating
+    # micro-batches yields a mean over the complete optimizer mini-batch.
+    # Older actor backends may already supply this info through the config.
+    for key in ("dp_size", "batch_num_tokens", "global_batch_size"):
+        if key in data:
+            config.global_batch_info[key] = data[key]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
     distillation_loss_fn = get_distillation_loss_fn(loss_config.loss_mode)
