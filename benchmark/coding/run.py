@@ -68,6 +68,8 @@ async def generate_jobs(jobs, args, path):
         max_keepalive_connections=max(16, args.concurrency),
     )
     api_timeout = getattr(args, "code_api_timeout", args.step_timeout)
+    experience = os.environ.get("SFT_T0_EXPERIENCE_TEXT")
+    system = [{"role": "system", "content": experience}] if experience else []
     async with AsyncOpenAI(base_url=args.openai_base_url,
                            api_key=os.environ.get("CODE_EVAL_API_KEY", "EMPTY"),
                            timeout=api_timeout, max_retries=2,
@@ -81,7 +83,7 @@ async def generate_jobs(jobs, args, path):
                 usage = None
                 try:
                     response = await client.chat.completions.create(
-                        model=args.model, messages=[{"role": "user", "content": task["prompt"]}],
+                        model=args.model, messages=[*system, {"role": "user", "content": task["prompt"]}],
                         temperature=args.temperature, top_p=args.top_p,
                         max_tokens=args.llm_max_completion_tokens or 16384,
                         **sampling_options(args, sample_index),
@@ -227,6 +229,82 @@ def score_in_container(job, args):
                            stderr=subprocess.DEVNULL, check=False)
 
 
+LOCAL_SANDBOX_ROOT = Path(os.environ.get("CODE_EVAL_SANDBOX_ROOT", "/var/tmp/code_eval_sandbox"))
+
+
+def _local_sandbox_python():
+    # Docker bind-mounts sys.base_prefix read-only; here the interpreter is copied
+    # once to a world-readable path because the scorer runs as uid 65534.
+    target = LOCAL_SANDBOX_ROOT / "python"
+    marker = target / ".source"
+    source = str(Path(sys.base_prefix).resolve())
+    if not marker.is_file() or marker.read_text() != source:
+        subprocess.run(["rm", "-rf", str(target)], check=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["cp", "-a", source, str(target)], check=True)
+        subprocess.run(["chmod", "-R", "a+rX", str(target)], check=True)
+        marker.write_text(source)
+    LOCAL_SANDBOX_ROOT.chmod(0o755)
+    # Without CAP_SYS_RESOURCE the host's hard RLIMIT_STACK cannot be raised, so
+    # evalplus' reliability_guard (stack = 4 GiB) would raise in every test
+    # process.  Clamp only RLIMIT_STACK requests to the hard maximum; every other
+    # limit is applied exactly as requested.
+    site = LOCAL_SANDBOX_ROOT / "site"
+    site.mkdir(exist_ok=True)
+    (site / "sitecustomize.py").write_text(
+        "import resource\n"
+        "_setrlimit = resource.setrlimit\n"
+        "def _clamped_setrlimit(which, limits):\n"
+        "    if which == resource.RLIMIT_STACK:\n"
+        "        hard = resource.getrlimit(which)[1]\n"
+        "        if hard != resource.RLIM_INFINITY:\n"
+        "            limits = tuple(hard if v == resource.RLIM_INFINITY else min(v, hard)\n"
+        "                           for v in limits)\n"
+        "    return _setrlimit(which, limits)\n"
+        "resource.setrlimit = _clamped_setrlimit\n"
+    )
+    site.chmod(0o755)
+    (site / "sitecustomize.py").chmod(0o644)
+    return target / "bin" / "python3.11"
+
+
+def score_locally(job, args):
+    """Docker-free counterpart of score_in_container (--code-sandbox local).
+
+    Same interpreter, dependencies, official sources and score.py, run as uid/gid
+    65534 with no_new_privs inside a fresh user+network namespace (no network),
+    with a private writable working directory.  Unlike Docker there is no
+    read-only root filesystem, memory or pids cgroup limit; the host's ordinary
+    permissions keep uid 65534 from writing outside its own directories.  The
+    stack limit is capped at the host's hard RLIMIT_STACK (see sitecustomize).
+    """
+    python = _local_sandbox_python()
+    with (tempfile.TemporaryDirectory(prefix="code-eval-job-") as job_temp,
+          tempfile.TemporaryDirectory(prefix="code-eval-work-", dir=LOCAL_SANDBOX_ROOT) as work_temp):
+        work = Path(work_temp)
+        output = work / "output"
+        output.mkdir()
+        (work / "tmp").mkdir()
+        for path in (work, output, work / "tmp"):
+            os.chown(path, 65534, 65534)
+        job_path = Path(job_temp) / "job.pkl"
+        with job_path.open("wb") as out:
+            pickle.dump(job, out)
+        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(work / "tmp"),
+               "TMPDIR": str(work / "tmp"), "XDG_CACHE_HOME": str(work / "tmp" / "cache"),
+               "PYTHONPATH": f"{LOCAL_SANDBOX_ROOT / 'site'}:{sysconfig.get_path('purelib')}:"
+                             f"{ROOT / 'official'}",
+               "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+               "TOKENIZERS_PARALLELISM": "false", "CODE_EVAL_OUTPUT": str(output)}
+        command = ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups",
+                   "--no-new-privs", "--", "unshare", "--user", "--net", "--",
+                   str(python), "-B", str(ROOT / "score.py")]
+        with job_path.open("rb") as job_input:
+            subprocess.run(command, stdin=job_input, env=env, cwd=work / "tmp",
+                           check=True, timeout=args.code_eval_timeout)
+        return json.loads((output / "scores.json").read_text())
+
+
 def main(args):
     for name in ("concurrency", "code_n_samples", "code_eval_workers", "code_timeout",
                  "code_eval_timeout", "code_api_timeout"):
@@ -245,7 +323,8 @@ def main(args):
     for name in ("samples.jsonl", "manifest.json", "results.json", "summary.json"):
         if (output / name).exists():
             raise ValueError(f"Output already contains {name}; choose a fresh --output-dir")
-    if not args.code_generate_only:
+    local_sandbox = getattr(args, "code_sandbox", "docker") == "local"
+    if not args.code_generate_only and not local_sandbox:
         if getattr(args, "code_execution_backend", "docker") == "nsjail":
             from nsjail_backend import check_runtime, memory_mib
             check_runtime()
@@ -271,7 +350,7 @@ def main(args):
     for name in ("top_k", "min_p", "presence_penalty", "repetition_penalty", "seed"):
         manifest[name] = getattr(args, "code_" + name, None)
     manifest["sanitizer"] = "evalplus-0.3.1-equivalent-search-pruning"
-    backend = getattr(args, "code_execution_backend", "docker")
+    backend = "local" if local_sandbox else getattr(args, "code_execution_backend", "docker")
     if not args.code_generate_only and backend == "nsjail":
         from nsjail_backend import provenance as sandbox_provenance
         manifest["execution"] = sandbox_provenance()
@@ -308,7 +387,9 @@ def main(args):
            "task_ids": list(grouped), "problems": problems, "solutions": list(grouped.values()),
            "k": k, "workers": args.code_eval_workers, "timeout": args.code_timeout,
            "base_only": False}
-    if backend == "nsjail":
+    if backend == "local":
+        results = score_locally(job, args)
+    elif backend == "nsjail":
         from nsjail_backend import score_in_nsjail
         results = score_in_nsjail(job, args)
     else:

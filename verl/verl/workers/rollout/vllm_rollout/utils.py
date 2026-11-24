@@ -326,6 +326,8 @@ class vLLMColocateWorkerExtension:
 
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
+                if getattr(model, "joint_prefix", False):
+                    model.refresh_joint_prefix_caches()
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.
@@ -380,10 +382,16 @@ class vLLMColocateWorkerExtension:
             else:
                 if param_updates:
                     for model in self._iter_all_models():
-                        loaded = model.load_weights(param_updates)
+                        joint_prefix = getattr(model, "joint_prefix", False)
+                        if joint_prefix:
+                            loaded = model.load_joint_prefix_weight_bucket(param_updates)
+                        else:
+                            loaded = model.load_weights(param_updates)
                         loaded_params = set(loaded or ())
                         expected_prefix_params = {
-                            name for name, _ in param_updates if name.endswith(".linear_attn.prefix_tokens")
+                            name for name, _ in param_updates
+                            if name.endswith(".linear_attn.prefix_tokens")
+                            or (joint_prefix and name.rsplit(".", 1)[-1].startswith("prefix_"))
                         }
                         weights_mapper = getattr(model, "hf_to_vllm_mapper", None)
                         if weights_mapper is not None and hasattr(weights_mapper, "apply_list"):

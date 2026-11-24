@@ -1149,6 +1149,29 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 input_ids_rmpad = input_ids.values().unsqueeze(0)  # (1, total_nnz)
                 if position_ids.dim() == 3:
                     position_ids_rmpad = position_ids.values().unsqueeze(1)  # (4, 1, total_nnz)
+                    total_nnz = input_ids_rmpad.shape[-1]
+                    if position_ids_rmpad.shape[0] != 4 or position_ids_rmpad.shape[-1] != total_nnz:
+                        # The v1/TransferQueue path can hand over 3D position ids whose
+                        # jagged layout no longer matches (4, total_nnz). Without
+                        # multi-modal inputs all four rows equal the per-sequence text
+                        # positions, so rebuild them from the input_ids offsets.
+                        if not getattr(self, "_warned_position_ids_layout", False):
+                            logger.warning(
+                                "Rebuilding 3D position_ids: got values %s (ragged_idx=%s), expected (4, %d)",
+                                tuple(position_ids.values().shape),
+                                getattr(position_ids, "_ragged_idx", None),
+                                total_nnz,
+                            )
+                            self._warned_position_ids_layout = True
+                        assert not any(k in multi_modal_inputs for k in ("image_grid_thw", "video_grid_thw")), (
+                            "cannot rebuild 3D position_ids for multi-modal inputs"
+                        )
+                        offsets = input_ids.offsets()
+                        lengths = (offsets[1:] - offsets[:-1]).tolist()
+                        text_pos = torch.cat(
+                            [torch.arange(n, device=input_ids_rmpad.device) for n in lengths]
+                        ).to(position_ids.dtype)
+                        position_ids_rmpad = text_pos.view(1, 1, -1).expand(4, 1, -1).contiguous()
                 else:
                     position_ids_rmpad = position_ids.values().unsqueeze(0)  # (1, total_nnz)
             else:

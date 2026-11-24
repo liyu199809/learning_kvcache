@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Any, List, Optional
@@ -40,7 +41,19 @@ class _OSRuntime:
         _ensure_reference_on_path()
         from src.tasks.instance.os_interaction.task import OSInteraction
         from src.tasks.instance.os_interaction.container import OSInteractionContainer
-        from src.tasks.instance.os_interaction.utility import CommandItem, CommandName
+        from src.tasks.instance.os_interaction.utility import (
+            CommandExecutionResult,
+            CommandItem,
+            CommandName,
+        )
+
+        # 无 Docker 的机器：LIFELONG_OS_BACKEND=local 改用 chroot 沙箱（每任务独立 rootfs）。
+        if os.environ.get("LIFELONG_OS_BACKEND", "docker").lower() == "local":
+            from .local_os import make_local_container_class
+
+            OSInteractionContainer = make_local_container_class(
+                OSInteractionContainer, CommandExecutionResult
+            )
 
         self.CommandItem = CommandItem
         self.CommandName = CommandName

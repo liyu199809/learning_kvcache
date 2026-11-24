@@ -26,8 +26,6 @@ except ModuleNotFoundError:
 
 DELTA_FILE = "independent_delta_kv_prefix.safetensors"
 ATTENTION_FILE = "residual_attention_prefix.safetensors"
-DELTA_SUFFIXES = (".prefix_k", ".prefix_v", ".prefix_beta_logits", ".prefix_a")
-ATTENTION_SUFFIXES = (".prefix_key_tokens", ".prefix_value_tokens")
 
 
 def _safetensor_shapes(path: Path) -> dict[str, list[int]]:
@@ -62,20 +60,12 @@ def export(checkpoint: Path, prepared: Path, output: Path, dtype, copy_mode: str
     metadata = _read_json(checkpoint / "trainable_only_meta.json")
     if metadata.get("checkpoint_type") != "trainable_only":
         raise ValueError("Expected a trainable-only checkpoint")
-    if metadata.get("trainable_type") != "hybrid_delta_residual_attention_prefix":
+    if metadata.get("trainable_type") not in ("hybrid_delta_residual_attention_prefix", "hybrid_state_rows_joint_prefix"):
         raise ValueError(f"Unexpected trainable_type: {metadata.get('trainable_type')!r}")
     parameters = metadata.get("parameters")
     names = metadata.get("parameter_names")
     if not isinstance(parameters, dict) or not isinstance(names, list) or set(names) != set(parameters):
         raise ValueError("Invalid checkpoint parameter metadata")
-    delta_names = [name for name in names if name.endswith(DELTA_SUFFIXES)]
-    attention_names = [name for name in names if name.endswith(ATTENTION_SUFFIXES)]
-    if len(delta_names) != 96 or len(attention_names) != 16:
-        raise ValueError(
-            f"Expected 96 Delta and 16 attention tensors, got {len(delta_names)} and {len(attention_names)}"
-        )
-    if len(delta_names) + len(attention_names) != len(names):
-        raise ValueError("Checkpoint contains unsupported trainable parameters")
     config = _read_json(prepared / "config.json")
     if config.get("architectures") != [
         "Qwen3_5HybridDeltaResidualAttentionPrefixForConditionalGeneration"
@@ -103,6 +93,12 @@ def export(checkpoint: Path, prepared: Path, output: Path, dtype, copy_mode: str
         )
     delta_shapes = _safetensor_shapes(prepared / DELTA_FILE)
     attention_shapes = _safetensor_shapes(prepared / ATTENTION_FILE)
+    delta_names = [name for name in names if name in delta_shapes]
+    attention_names = [name for name in names if name in attention_shapes]
+    joint = bool(text_config.get("residual_attention_prefix_joint_softmax", False))
+    expected_type = "hybrid_state_rows_joint_prefix" if joint else "hybrid_delta_residual_attention_prefix"
+    if metadata["trainable_type"] != expected_type:
+        raise ValueError(f"Prepared model and checkpoint require matching prefix structure ({expected_type})")
     expected_shapes = {**delta_shapes, **attention_shapes}
     checkpoint_shapes = {name: parameters[name]["shape"] for name in names}
     if checkpoint_shapes != expected_shapes:
@@ -144,7 +140,7 @@ def export(checkpoint: Path, prepared: Path, output: Path, dtype, copy_mode: str
         )
         manifest = {
             "format_version": 1,
-            "trainable_type": "hybrid_delta_residual_attention_prefix",
+            "trainable_type": expected_type,
             "source_checkpoint": str(checkpoint),
             "prepared_model": str(prepared),
             "world_size": world_size,

@@ -232,9 +232,12 @@ class Qwen3_5IndependentDeltaKVPrefixForConditionalGeneration(
 ):
     """Native vLLM Qwen3.5 with independent Delta-space prefixes."""
 
+    def _delta_net_class(self):
+        return Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet
+
     def __init__(self, *, vllm_config, prefix: str = "model"):
         original_cls = getattr(qwen3_5, _GDN_CLASS_NAME)
-        setattr(qwen3_5, _GDN_CLASS_NAME, Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet)
+        setattr(qwen3_5, _GDN_CLASS_NAME, self._delta_net_class())
         try:
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         finally:
@@ -245,8 +248,10 @@ class Qwen3_5IndependentDeltaKVPrefixForConditionalGeneration(
             if isinstance(module, Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet):
                 module.invalidate_independent_delta_prefix_cache()
 
-    def load_weights(self, weights):
+    def load_weights(self, weights, *, partial: bool = False):
         loaded = super().load_weights(weights)
+        if partial:
+            return loaded
         expected = {
             name
             for name, _ in self.named_parameters()

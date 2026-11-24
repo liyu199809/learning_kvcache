@@ -76,9 +76,11 @@ PPO_RAY_RUNTIME_ENV = {
         "NCCL_DEBUG": "WARN",
         "VLLM_LOGGING_LEVEL": "WARN",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
-        # TODO: disable compile cache due to cache corruption issue
-        # https://github.com/vllm-project/vllm/issues/31199
-        "VLLM_DISABLE_COMPILE_CACHE": "1",
+        # Compile cache was disabled upstream over a corruption report
+        # (https://github.com/vllm-project/vllm/issues/31199); re-enabled so
+        # repeated runs of the same model skip torch.compile. Export
+        # VLLM_DISABLE_COMPILE_CACHE=1 to opt out.
+        "VLLM_DISABLE_COMPILE_CACHE": "0",
         # Needed for multi-processes colocated on same NPU device
         # https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/maintenref/envvar/envref_07_0143.html
         "HCCL_HOST_SOCKET_PORT_RANGE": "auto",

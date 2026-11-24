@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -61,4 +62,6 @@ def score(job):
 if __name__ == "__main__":
     job = pickle.load(sys.stdin.buffer)  # Produced locally by run.py, never downloaded.
     result = score(job)
-    Path("/output/scores.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    # CODE_EVAL_OUTPUT: only set by run.py's Docker-free sandbox (--code-sandbox local).
+    output_dir = Path(os.environ.get("CODE_EVAL_OUTPUT", "/output"))
+    (output_dir / "scores.json").write_text(json.dumps(result, indent=2), encoding="utf-8")

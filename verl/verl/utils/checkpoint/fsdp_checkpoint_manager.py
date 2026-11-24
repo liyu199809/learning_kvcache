@@ -148,7 +148,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             text_config, "residual_attention_prefix_num_virtual_tokens", None
         )
         if independent_delta_tokens is not None and residual_attention_tokens is not None:
-            trainable_type = "hybrid_delta_residual_attention_prefix"
+            trainable_type = (
+                "hybrid_state_rows_joint_prefix"
+                if getattr(text_config, "residual_attention_prefix_joint_softmax", False)
+                else "hybrid_delta_residual_attention_prefix"
+            )
             num_virtual_tokens = independent_delta_tokens
         elif independent_delta_tokens is not None:
             trainable_type = "independent_delta_kv_prefix"

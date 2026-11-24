@@ -912,7 +912,17 @@ def maybe_fix_3d_position_ids(data: TensorDict):
     # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
     # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
     if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        data["position_ids"]._ragged_idx = 2
+        position_ids = data["position_ids"]
+        lengths = position_ids.offsets().diff()
+        if getattr(position_ids, "_ragged_idx", 1) == 1 and bool((lengths == 4).all()):
+            # torch.nested.as_nested_tensor infers the ragged dim from the
+            # components; when every (4, seq_len) sample has the same seq_len
+            # (e.g. a single sample per rank) it picks dim 1 and the offsets
+            # count the 4 rope rows instead of tokens. Rebuild with ragged dim 2.
+            values = position_ids.values()
+            data["position_ids"] = nested_tensor_from_tensor_list(list(values.split(4, dim=0)), ragged_idx=2)
+        else:
+            position_ids._ragged_idx = 2
 
 
 def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:

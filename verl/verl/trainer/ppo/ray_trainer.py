@@ -1547,7 +1547,29 @@ class RayPPOTrainer:
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                    distillation = self.config.get("distillation")
+                    loss_config = (
+                        self.distillation_config.distillation_loss if is_distillation_enabled(distillation) else None
+                    )
+                    correction_enabled = rollout_corr_config is not None and (
+                        bypass_recomputing_logprobs
+                        or rollout_corr_config.get("rollout_is") is not None
+                        or rollout_corr_config.get("rollout_rs") is not None
+                    )
+                    skip_old_policy = (
+                        loss_config is not None
+                        and loss_config.loss_settings.use_topk
+                        and not loss_config.use_task_rewards
+                        and not loss_config.use_policy_gradient
+                        and not correction_enabled
+                        and not self.config.algorithm.use_kl_in_reward
+                        and not self.use_reference_policy
+                        and not self.use_critic
+                        and self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO
+                    )
+                    if skip_old_policy:
+                        metrics["actor/skipped_old_policy_forward"] = 1
+                    elif bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
                         apply_bypass_mode(
@@ -1588,7 +1610,8 @@ class RayPPOTrainer:
 
                                 metrics.update(calculate_debug_metrics(batch))
 
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    if not skip_old_policy:
+                        assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
@@ -1624,7 +1647,7 @@ class RayPPOTrainer:
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
-                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+                            and not (bypass_recomputing_logprobs or skip_old_policy)  # Only in decoupled mode
                         ):
                             from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 

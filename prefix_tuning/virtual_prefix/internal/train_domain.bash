@@ -176,7 +176,6 @@ DISTILLATION_TOPK=${DISTILLATION_TOPK:-64}
 # cannot consume several GiB during the distillation update.
 DISTILLATION_TOPK_CHUNK_SIZE=${DISTILLATION_TOPK_CHUNK_SIZE:-512}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}
-ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
 TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-True}
 ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
 TEACHER_TEMPERATURE=${TEACHER_TEMPERATURE:-1.0}
@@ -193,12 +192,15 @@ if [[ ! -f "$TEACHER_MODEL/config.json" ]]; then
     echo "Teacher model checkpoint is missing or invalid: $TEACHER_MODEL" >&2
     exit 1
 fi
-EXPECTED_PREFIX_NUMEL=$("$PYTHON_BIN" - "$MODEL/config.json" "$TRAINER_MODE" "$PARTIAL_WARMUP_BATCHES" "$PARTIAL_MAX_OFF_POLICY" "$PARTIAL_OFF_POLICY_STRATEGY" "$PARTIAL_ROLLOUT_TARGET" "$TRAIN_BATCH_SIZE" <<'PY'
+PREFIX_SETTINGS=$("$PYTHON_BIN" - "$MODEL/config.json" "$TRAINER_MODE" "$PARTIAL_WARMUP_BATCHES" "$PARTIAL_MAX_OFF_POLICY" "$PARTIAL_OFF_POLICY_STRATEGY" "$PARTIAL_ROLLOUT_TARGET" "$TRAIN_BATCH_SIZE" <<'PY'
 import importlib.metadata
 import importlib.util
 import json
 import sys
 
+with open(sys.argv[1], encoding="utf-8") as model_config:
+    config = json.load(model_config)
+joint = config["text_config"].get("residual_attention_prefix_joint_softmax", False)
 plugins = importlib.metadata.entry_points(group="vllm.general_plugins")
 if not any(p.value == "prefix_tuning.virtual_prefix.vllm_plugin:register" for p in plugins):
     raise SystemExit(f"Hybrid prefix vLLM plugin is missing in {sys.executable}; use the kvcache environment.")
@@ -211,11 +213,26 @@ if sys.argv[2] == "colocate_async":
         raise SystemExit("PARTIAL_OFF_POLICY_STRATEGY must be wait or drop.")
     if int(sys.argv[6]) < int(sys.argv[7]):
         raise SystemExit("PARTIAL_ROLLOUT_TARGET must be >= TRAIN_BATCH_SIZE.")
-c = json.load(open(sys.argv[1]))["hybrid_prefix"]
-assert c["trainable_tensor_count"] == 112
-print(c["trainable_numel"])
+c = config["hybrid_prefix"]
+if not joint:
+    assert c["trainable_tensor_count"] == 112
+print(c["trainable_numel"], c["trainable_tensor_count"], int(joint))
 PY
 )
+read -r EXPECTED_PREFIX_NUMEL EXPECTED_PREFIX_TENSORS JOINT_PREFIX <<< "$PREFIX_SETTINGS"
+PREFIX_PARAMS='.*[.](linear_attn[.](prefix_k|prefix_v|prefix_beta_logits|prefix_a)|self_attn[.](prefix_key_tokens|prefix_value_tokens))$'
+PREFIX_ENGINE_OVERRIDES=()
+if [[ "$JOINT_PREFIX" == 1 ]]; then
+    ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
+    PREFIX_PARAMS='.*[.](linear_attn[.](prefix_state_key|prefix_state_value|prefix_state_temperature|prefix_state_bias)|self_attn[.](prefix_key_tokens|prefix_value_tokens|prefix_logit_bias))$'
+    PREFIX_ENGINE_OVERRIDES+=(
+        '+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_cascade_attn=True'
+        '+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_config={backend:FLASH_ATTN,flash_attn_version:3,flash_attn_max_num_splits_for_cuda_graph:1}'
+        '+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config={mode:0,cudagraph_mode:FULL_DECODE_ONLY}'
+    )
+else
+    ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
+fi
 if [[ ! -f "$TRAIN_FILE" || ! -f "$VAL_FILE" ]]; then
     echo "Dataset files are missing under $DATA_ROOT" >&2
     exit 1
@@ -355,8 +372,8 @@ fi
     +data.apply_chat_template_kwargs.enable_thinking="$ENABLE_THINKING" \
     actor_rollout_ref.model.path="$MODEL" \
     actor_rollout_ref.model.trust_remote_code=True \
-    'actor_rollout_ref.model.trainable_param_patterns=[".*[.](linear_attn[.](prefix_k|prefix_v|prefix_beta_logits|prefix_a)|self_attn[.](prefix_key_tokens|prefix_value_tokens))$"]' \
-    actor_rollout_ref.model.expected_trainable_param_count=112 \
+    "actor_rollout_ref.model.trainable_param_patterns=[\"$PREFIX_PARAMS\"]" \
+    actor_rollout_ref.model.expected_trainable_param_count="$EXPECTED_PREFIX_TENSORS" \
     actor_rollout_ref.model.expected_trainable_numel="$EXPECTED_PREFIX_NUMEL" \
     actor_rollout_ref.model.rollout_sync_trainable_only=True \
     actor_rollout_ref.actor.checkpoint.save_trainable_only=True \
@@ -392,6 +409,7 @@ fi
     actor_rollout_ref.rollout.max_num_batched_tokens="$MAX_NUM_BATCHED_TOKENS" \
     actor_rollout_ref.rollout.max_num_seqs=64 \
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt={image:0,video:0}' \
+    "${PREFIX_ENGINE_OVERRIDES[@]}" \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$PPO_MAX_TOKEN_LEN_PER_GPU" \
     actor_rollout_ref.rollout.calculate_log_probs=True \

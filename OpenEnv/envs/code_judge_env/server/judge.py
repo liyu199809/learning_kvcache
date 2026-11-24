@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -52,14 +53,42 @@ def _limit_worker() -> None:
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
 
 
+@functools.lru_cache(maxsize=1)
+def _namespace_args(unshare: str) -> tuple[str, ...] | None:
+    """Pick the strongest namespace set this host allows.
+
+    Containers without CAP_SYS_ADMIN reject root-style namespaces, and a
+    masked container /proc blocks --mount-proc inside a user namespace, so
+    fall back to a user+net+mount namespace (still offline, still able to
+    hide the dataset with tmpfs) before giving up on namespaces entirely.
+    """
+    preferred = ["--net", "--mount", "--fork", "--pid", "--mount-proc"]
+    if os.geteuid() != 0:
+        preferred = ["--user", "--map-root-user", *preferred]
+    candidates = [
+        preferred,
+        ["--user", "--map-root-user", "--net", "--mount", "--fork"],
+    ]
+    for args in candidates:
+        probe = subprocess.run(
+            [unshare, *args, "true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return tuple(args)
+    return None
+
+
 def _sandbox_command(worker_path: Path) -> list[str]:
     unshare = shutil.which("unshare")
     python_command = [sys.executable, "-I", "-B", str(worker_path)]
     if unshare is None:
         return python_command
-    namespace_args = ["--net", "--mount", "--fork", "--pid", "--mount-proc"]
-    if os.geteuid() != 0:
-        namespace_args = ["--user", "--map-root-user", *namespace_args]
+    namespace_args = _namespace_args(unshare)
+    if namespace_args is None:
+        return python_command
     return [unshare, *namespace_args, *python_command]
 
 
@@ -103,7 +132,11 @@ def judge_answer(final_answer: str, tests: dict[str, Any]) -> dict[str, Any]:
     with _JUDGE_SEMAPHORE, tempfile.TemporaryDirectory(prefix="openenv_taco_judge_") as work_dir:
         work_path = Path(work_dir)
         work_path.chmod(0o700)
-        if os.geteuid() == 0:
+        # Inside a root-mapped user namespace uid 65534 is unmapped, so the
+        # worker stays uid 0 there and cannot use a nobody-owned 0700 dir.
+        unshare = shutil.which("unshare")
+        in_user_namespace = bool(unshare) and "--user" in (_namespace_args(unshare) or ())
+        if os.geteuid() == 0 and not in_user_namespace:
             try:
                 os.chown(work_path, 65534, 65534)
             except OSError:

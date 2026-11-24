@@ -13,7 +13,8 @@ class ComposeHybridPrefixTest(SplitMergeHybridPrefixTest):
         other = self.root / 'independent'
         shutil.copytree(self.source, other)
         filename = 'residual_attention_prefix.safetensors'
-        values = load_file(str(other / filename))
+        # Keep the expected values independent of the file overwritten below.
+        values = {n: t.clone() for n, t in load_file(str(other / filename)).items()}
         save_file({n: t + 7 for n, t in values.items()}, str(other / filename))
         a, b = self.root / 'ab', self.root / 'ba'
         compose([self.source, other], a)

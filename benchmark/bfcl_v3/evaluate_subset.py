@@ -42,6 +42,14 @@ def main():
                 continue
             rows = select_rows(source, ids)
             (destination / source.name).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    # The official aggregator uses the prompt counts of categories outside
+    # the subset to populate its summary CSV. These files are never evaluated
+    # unless their categories have result rows and are requested.
+    for source in eval_config.PROMPT_PATH.glob("BFCL_v3_*.json"):
+        category = source.stem.removeprefix("BFCL_v3_")
+        destination = prompt_dir / source.name
+        if category not in requested and not destination.exists():
+            destination.symlink_to(source.resolve())
     (args.subset_dir / 'selection.json').write_text(json.dumps(requested, indent=2))
     # Only input locations change. Official parsers, state transitions and scoring stay intact.
     eval_config.PROMPT_PATH = prompt_dir.resolve()

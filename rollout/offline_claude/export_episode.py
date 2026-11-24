@@ -1,5 +1,6 @@
 """Read a normalized episode or convert an older Claude event trace."""
 import argparse
+from collections import deque
 import json
 from pathlib import Path
 
@@ -13,12 +14,13 @@ def initial_messages(question, thinking):
 
 
 class MessageStream:
-    def __init__(self, session_id, names):
+    def __init__(self, session_id, names, *, seen_call_ids=None):
         self.session_id = session_id
         self.names = names
         self.turns = {}
         self.calls = {}
         self.results = {}
+        self.seen_call_ids = set() if seen_call_ids is None else seen_call_ids
 
     def accept(self, event):
         role = event["type"]
@@ -42,22 +44,36 @@ class MessageStream:
             kind = b["type"]
             if role == "assistant" and kind == "tool_use":
                 name, call_id = b["name"], b["id"]
-                if call_id in self.calls or name not in self.names:
-                    raise ValueError(f"Duplicate call or missing schema for {name}")
-                self.calls[call_id] = name
-                turn.setdefault("tool_calls", []).append({"id": call_id, "type": "function",
-                    "function": {"name": name, "arguments": b["input"]}})
+                call = {"id": call_id, "type": "function",
+                        "function": {"name": name, "arguments": b["input"]}}
+                reasons = []
+                if call_id in self.seen_call_ids:
+                    reasons.append("duplicate_call_id")
+                if name not in self.names:
+                    reasons.append("unknown_tool")
+                if reasons:
+                    call["invalid_tool_reasons"] = reasons
+                self.seen_call_ids.add(call_id)
+                self.calls.setdefault(call_id, deque()).append(call)
+                turn.setdefault("tool_calls", []).append(call)
             elif role == "user" and kind == "tool_result":
                 call_id = b["tool_use_id"]
-                if call_id not in self.calls or call_id in self.results:
+                pending = self.calls.get(call_id)
+                if not pending:
                     raise ValueError(f"Unmatched tool result {call_id}")
+                call = pending.popleft()
                 value = b["content"]
                 if isinstance(value, list):
                     if any(part["type"] != "text" for part in value):
                         raise ValueError("Unsupported non-text tool result")
                     value = "\n".join(part["text"] for part in value)
-                self.results[call_id] = {"role": "tool", "name": self.calls[call_id],
-                                         "tool_call_id": call_id, "content": value}
+                result = {"role": "tool", "name": call["function"]["name"],
+                          "tool_call_id": call_id, "content": value}
+                if reasons := call.get("invalid_tool_reasons"):
+                    result["invalid_tool_reasons"] = reasons
+                    if b.get("is_error"):
+                        result["is_error"] = True
+                self.results[id(call)] = result
             elif role == "assistant" and kind == "thinking":
                 turn["reasoning_content"] = turn.get("reasoning_content", "") + b["thinking"]
             elif role == "assistant" and kind == "text":
@@ -70,11 +86,25 @@ class MessageStream:
         for turn in self.turns.values():
             yield turn
             for call in turn.get("tool_calls", []):
-                if call["id"] in self.results:
-                    yield self.results[call["id"]]
+                if id(call) in self.results:
+                    yield self.results[id(call)]
+
+    def unknown_tool_streak(self, previous=0):
+        """Count consecutive assistant tool batches whose calls are all unknown."""
+        streak = previous
+        for turn in self.turns.values():
+            calls = turn.get("tool_calls")
+            if not calls:
+                continue
+            if not all("unknown_tool" in call.get("invalid_tool_reasons", ()) for call in calls):
+                streak = 0
+            elif all(id(call) in self.results for call in calls):
+                streak += 1
+        return streak
 
     def check_complete(self):
-        if self.calls.keys() != self.results.keys():
+        if any("duplicate_call_id" not in call.get("invalid_tool_reasons", ())
+               for pending in self.calls.values() for call in pending):
             raise ValueError("Missing tool result in completed episode")
 
 

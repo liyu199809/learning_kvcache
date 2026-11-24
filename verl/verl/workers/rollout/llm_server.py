@@ -197,6 +197,51 @@ class LLMServerClient:
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         self._load_balancer.release_server.remote(server_id=server_id)
 
+    async def generate_teacher_batch(self, requests: list[dict[str, Any]]) -> list[Any]:
+        """Batch teacher replies per replica while preserving one lease per request."""
+        groups = {}
+        leased = []
+
+        async def acquire(request):
+            server_id, server = await self._acquire_server(uuid4().hex)
+            leased.append(server_id)
+            return server_id, server, request
+
+        try:
+            acquisitions = await asyncio.gather(
+                *(acquire(request) for request in requests), return_exceptions=True
+            )
+            for index, entry in enumerate(acquisitions):
+                if isinstance(entry, BaseException):
+                    raise entry
+                server_id, server, request = entry
+                _, group = groups.setdefault(server_id, (server, []))
+                group.append((index, request))
+
+            async def run_group(server, group):
+                try:
+                    outputs = await server.generate_teacher_batch.remote(
+                        [dict(request, request_id=uuid4().hex) for _, request in group]
+                    )
+                    return [(index, output) for (index, _), output in zip(group, outputs, strict=True)]
+                except Exception as error:
+                    return [(index, error) for index, _ in group]
+
+            batches = await asyncio.gather(
+                *(run_group(server, group) for server, group in groups.values()),
+                return_exceptions=True,
+            )
+            ordered = [None] * len(requests)
+            for batch in batches:
+                if isinstance(batch, BaseException):
+                    raise batch
+                for index, output in batch:
+                    ordered[index] = output
+            return ordered
+        finally:
+            for server_id in leased:
+                self._release_server(server_id)
+
     @rollout_trace_op
     async def generate(
         self,

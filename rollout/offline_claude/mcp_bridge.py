@@ -20,16 +20,25 @@ def request(payload):
 
 
 async def main():
-    server = Server("episode")
-
-    @server.list_tools()
     async def list_tools():
         return [types.Tool(**tool) for tool in request({"op": "list"})]
 
-    @server.call_tool()
     async def call_tool(name, arguments):
         value = request({"op": "call", "name": name, "arguments": arguments})
         return [types.TextContent(type="text", text=value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))]
+
+    if hasattr(Server, "list_tools"):
+        server = Server("episode")
+        server.list_tools()(list_tools)
+        server.call_tool()(call_tool)
+    else:
+        async def on_list_tools(ctx, params):
+            return types.ListToolsResult(tools=await list_tools())
+
+        async def on_call_tool(ctx, params):
+            return types.CallToolResult(content=await call_tool(params.name, params.arguments))
+
+        server = Server("episode", on_list_tools=on_list_tools, on_call_tool=on_call_tool)
 
     async with stdio_server() as (reader, writer):
         await server.run(reader, writer, server.create_initialization_options())

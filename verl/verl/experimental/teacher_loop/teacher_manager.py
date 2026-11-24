@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import logging
 import os
 from typing import Any, Optional
@@ -95,6 +96,46 @@ class AsyncTeacherLLMServerManager:
                 f"do not match teacher routing keys {sorted(expected)}."
             )
         self.teacher_client: dict[str, LLMServerClient] = teacher_client
+        self._pending_scores = {}
+        self._score_timers = {}
+        self._score_tasks = set()
+
+    async def _score_vllm(self, teacher_key: str, request: dict[str, Any]):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        pending = self._pending_scores.setdefault(teacher_key, [])
+        pending.append((request, future))
+        if len(pending) == 1:
+            self._score_timers[teacher_key] = loop.call_later(0.001, self._flush_scores, teacher_key)
+        if len(pending) >= 16:
+            self._score_timers[teacher_key].cancel()
+            self._flush_scores(teacher_key)
+        return await future
+
+    def _flush_scores(self, teacher_key: str):
+        self._score_timers.pop(teacher_key, None)
+        batch = [(request, future) for request, future in self._pending_scores.pop(teacher_key) if not future.cancelled()]
+        if batch:
+            task = asyncio.create_task(self._return_scores(teacher_key, batch))
+            self._score_tasks.add(task)
+            task.add_done_callback(self._score_tasks.discard)
+
+    async def _return_scores(self, teacher_key: str, batch):
+        try:
+            outputs = await self.teacher_client[teacher_key].generate_teacher_batch(
+                [request for request, _ in batch]
+            )
+            for (_, future), output in zip(batch, outputs, strict=True):
+                if future.done():
+                    continue
+                if isinstance(output, BaseException):
+                    future.set_exception(output)
+                else:
+                    future.set_result(output)
+        except (Exception, asyncio.CancelledError) as error:
+            for _, future in batch:
+                if not future.done():
+                    future.set_exception(error)
 
     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
         if len(self.teacher_model_configs) == 1:
@@ -130,8 +171,7 @@ class AsyncTeacherLLMServerManager:
                 f"Teacher input ({len(sequence_ids)} tokens, +1 to score) exceeds the teacher's "
                 f"max_model_len ({max_model_len}); raise the teacher's max_model_len or shorten the input."
             )
-        teacher_output = await client.generate(
-            request_id=uuid4().hex,
+        request = dict(
             prompt_ids=sequence_ids,
             sampling_params=_get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config),
             image_data=multi_modal_data.get("images"),
@@ -139,6 +179,10 @@ class AsyncTeacherLLMServerManager:
             audio_data=multi_modal_data.get("audios"),
             mm_processor_kwargs=mm_processor_kwargs,
         )
+        if teacher_model_config.inference.name == "vllm":
+            teacher_output = await self._score_vllm(teacher_key, request)
+        else:
+            teacher_output = await client.generate(request_id=uuid4().hex, **request)
         # Shapes: # S, (1 or K), where S is the response length, K is either 1 or topk depending on
         # the distillation loss settings.
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)

@@ -131,9 +131,11 @@ class RetryLLM:
                  timeout: float = 120.0, retries: int = 3,
                  limiter: "RateLimiter | None" = None):
         # RetryLLM owns the retry policy. Disable the SDK's hidden retry layer
-        # so one logical attempt maps to one HTTP request.
+        # so one logical attempt maps to one HTTP request, and give the SDK the
+        # same per-call timeout: its 600 s default would otherwise cut off
+        # longer generations before `timeout` is reached.
         self._client = AsyncOpenAI(
-            base_url=base_url, api_key=api_key, max_retries=0)
+            base_url=base_url, api_key=api_key, max_retries=0, timeout=timeout)
         self._model = model
         self._timeout = timeout
         self._retries = retries

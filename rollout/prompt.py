@@ -528,8 +528,20 @@ def build_teacher_advice_input(task: str, student_conversation: list[dict],
     return "\n".join(parts)
 
 
+def _annotated_excerpt(text: str, limit: int, *, keep_tail: bool = True) -> str:
+    if len(text) <= limit:
+        return text
+    lead = (limit + 1) // 2 if keep_tail else limit
+    tail = limit - lead
+    suffix = "\n" + text[-tail:] if tail else ""
+    return f"{text[:lead]}\n[... {len(text) - limit} chars omitted ...]{suffix}"
+
+
 def _render_student_conversation(messages: list[dict],
-                                  max_chars_per_msg: int = 1200) -> str:
+                                  max_chars_per_msg: int = 1200, *,
+                                  annotated_message_chars: int | None = None,
+                                  latest_answer_chars: int | None = None,
+                                  tool_result_chars: int | None = None) -> str:
     """Render the student's messages list in a compact plain-text form.
 
     Native function-calling messages are handled explicitly: an assistant
@@ -537,18 +549,37 @@ def _render_student_conversation(messages: list[dict],
     and tool results arrive as `role:"tool"` messages. Rendering these is
     essential — otherwise the teacher would see an empty trajectory and its
     diagnosis quality collapses."""
+    latest_answer = None
+    if annotated_message_chars is not None:
+        latest_answer = next((i for i in reversed(range(len(messages)))
+                              if messages[i].get("role") == "assistant"
+                              and messages[i].get("content")
+                              and not messages[i].get("tool_calls")), None)
     lines: list[str] = []
+    if tool_result_chars is not None:
+        lines.append("[... N chars omitted ...] marks an excerpt in this teacher view. "
+                     "The student sees the original content before this view is rendered.")
     for i, m in enumerate(messages):
         role = m.get("role", "?")
         if role == "system":
             continue  # not useful for the teacher; occupies tokens
 
-        content = str(m.get("content") or "")[:max_chars_per_msg]
+        content = str(m.get("content") or "")
+        if annotated_message_chars is None:
+            content = content[:max_chars_per_msg]
+        elif role == "tool":
+            content = _annotated_excerpt(content, tool_result_chars or max_chars_per_msg,
+                                         keep_tail=tool_result_chars is not None)
+        else:
+            limit = latest_answer_chars if i == latest_answer else None
+            content = _annotated_excerpt(content, limit or annotated_message_chars)
 
         if role == "assistant":
             reasoning = str(m.get("reasoning") or "")
             if reasoning:
-                if len(reasoning) > max_chars_per_msg:
+                if annotated_message_chars is not None:
+                    reasoning = _annotated_excerpt(reasoning, annotated_message_chars)
+                elif len(reasoning) > max_chars_per_msg:
                     half = max_chars_per_msg // 2
                     reasoning = (
                         reasoning[:half]
@@ -562,7 +593,11 @@ def _render_student_conversation(messages: list[dict],
             for tc in tool_calls:
                 fn = tc.get("function") or {}
                 name = fn.get("name", "")
-                args = str(fn.get("arguments", ""))[:max_chars_per_msg]
+                args = str(fn.get("arguments", ""))
+                if annotated_message_chars is None:
+                    args = args[:max_chars_per_msg]
+                else:
+                    args = _annotated_excerpt(args, annotated_message_chars)
                 lines.append(f"[{i:02d}] assistant → tool_call {name}({args})")
             if not content and not tool_calls:
                 lines.append(f"[{i:02d}] assistant: ")

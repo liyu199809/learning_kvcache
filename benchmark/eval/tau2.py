@@ -130,7 +130,11 @@ def run_tau2(args) -> int:
             "max_tokens": user_max_completion_tokens,
         }
         if not user_thinking:
-            user_llm_args["extra_body"] = {"thinking": {"type": "disabled"}}
+            user_llm_args["extra_body"] = (
+                {"chat_template_kwargs": {"enable_thinking": False}}
+                if user_base_url.startswith("http://127.0.0.1:") else
+                {"thinking": {"type": "disabled"}}
+            )
     else:
         if getattr(args, "tau2_require_external_user", False):
             raise SystemExit(
@@ -214,7 +218,11 @@ def run_tau2(args) -> int:
         # 思考长度默认压到最低：Ark 的 budget_tokens 不生效（实测 budget=1 反而
         # 多于默认），disabled 是唯一可靠的最低档（0 思考 token）。
         if not judge_thinking:
-            nl_judge_args["extra_body"] = {"thinking": {"type": "disabled"}}
+            nl_judge_args["extra_body"] = (
+                {"chat_template_kwargs": {"enable_thinking": False}}
+                if judge_base_url.startswith("http://127.0.0.1:") else
+                {"thinking": {"type": "disabled"}}
+            )
     else:
         if getattr(args, "tau2_require_external_judge", False):
             raise SystemExit(

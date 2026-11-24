@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import os
 import re
 import sys
 import threading
@@ -108,6 +109,12 @@ class _DBRuntime:
             DirectTypeAnswerValidator,
         )
         from src.tasks.instance.db_bench.container import DBBenchContainer
+
+        # 无 Docker 的机器：LIFELONG_DB_BACKEND=local 改用本机 mysqld（每任务独立实例）。
+        if os.environ.get("LIFELONG_DB_BACKEND", "docker").lower() == "local":
+            from .local_mysql import make_local_container_class
+
+            DBBenchContainer = make_local_container_class(DBBenchContainer)
 
         self.AnswerType = AnswerType
         self.DirectTypeAnswerValidator = DirectTypeAnswerValidator

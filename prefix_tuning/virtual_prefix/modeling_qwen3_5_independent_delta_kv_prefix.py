@@ -345,9 +345,12 @@ class Qwen3_5IndependentDeltaKVPrefixForConditionalGeneration(
 ):
     """Qwen3.5 conditional generation with independent Delta-space prefixes."""
 
+    def _delta_net_class(self, config):
+        return Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet
+
     def __init__(self, config):
         original_cls = qwen3_5.Qwen3_5GatedDeltaNet
-        qwen3_5.Qwen3_5GatedDeltaNet = Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet
+        qwen3_5.Qwen3_5GatedDeltaNet = self._delta_net_class(config)
         try:
             super().__init__(config)
         finally:

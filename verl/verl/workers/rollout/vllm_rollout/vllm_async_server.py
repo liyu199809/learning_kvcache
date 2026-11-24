@@ -721,6 +721,13 @@ class vLLMHttpServer:
             extra_fields=extra_fields,
         )
 
+    async def generate_teacher_batch(self, requests: list[dict[str, Any]]) -> list[TokenOutput | BaseException]:
+        """Submit each prompt independently and return one batch across the actor boundary."""
+        return await asyncio.gather(
+            *(self.generate(**request) for request in requests),
+            return_exceptions=True,
+        )
+
     def _select_decode_peer(self) -> ActorHandle:
         """Round-robin across decode peers."""
         peer = self._pd_decode_peers[self._pd_peer_idx % len(self._pd_decode_peers)]

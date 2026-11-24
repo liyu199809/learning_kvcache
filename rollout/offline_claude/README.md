@@ -32,7 +32,7 @@ python rollout/offline_claude/collect.py taco taco 102
 
 Qwen3.5-4B 批量采集使用 `serve_q35_dp16.sh`，单机 DP=16、TP=1。批次输出目录为 `outputs/q35_dp16_session_experience/`，任务并发 32。
 
-批量采集默认使用 `--teacher-session`。每题创建一个 Claude Code 会话。每次学生提交后由环境评分；未满分时，GLM-5.3-joybuilder 读取本题的会话和公开评分摘要，必要时调用诊断工具，再把自然语言指令作为同一会话的下一条 user 消息发送给学生。AWM 和 EnvScaler 延续业务状态。TACO 对每次提交独立调用 CodeJudge。整题共享 1200 秒，包括所有学生推理、teacher 调用和评分。满分、超时或执行错误时结束。
+批量采集默认使用 `--teacher-session`。每题创建一个 Claude Code 会话。每次学生提交后由环境评分；未满分时，GLM-5.3-joybuilder 读取本题的会话和公开评分摘要，必要时调用诊断工具，再把自然语言建议作为同一会话的下一条 user 消息发送给学生。提示词要求 teacher 指明如何继续检查或修复，避免给出题目要求学生自行找到的答案。AWM 和 EnvScaler 延续业务状态。TACO 对每次提交独立调用 CodeJudge。整题共享 1200 秒，包括所有学生推理、teacher 调用和评分。满分、超时或执行错误时结束。
 
 完整会话按顺序写入 `events.jsonl`。`episode.json` 的 `rounds` 保留每次提交、评分和 teacher 的指令及工具记录；`instruction_message_index` 对应轨迹中指令的位置（从零开始）。批次索引中的 `reward` 为首轮分数，`last_verified_reward` 为最近一次评分，`verified_rounds` 为已评分次数。历史的独立重试实验仍可用 `--teacher-retry` 单独运行。
 

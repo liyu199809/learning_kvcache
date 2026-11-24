@@ -65,6 +65,11 @@ class ResidualPrefixAttentionMixin:
     def _get_prefix_key_value(
         self, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Weight loading refreshes these buffers outside the captured forward.
+        if (getattr(self, "_prefix_cache_refreshed", False)
+                and self._cached_prefix_key is not None
+                and self._cached_prefix_key.dtype == dtype):
+            return self._cached_prefix_key, self._cached_prefix_value
         cache_key = (
             self.prefix_key_tokens._version,
             self.prefix_value_tokens._version,

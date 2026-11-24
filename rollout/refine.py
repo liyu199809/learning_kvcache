@@ -736,6 +736,10 @@ class RefineJob:
     judge_temperature: float = 1.0
     judge_max_tokens: int = 8192
     judge_timeout: float = 180.0
+    # Optional text memory (--memory-jsonl): appended to the system prompt or
+    # to the user task, so the same harness runs memory / oracle ablations.
+    memory_text: str | None = None
+    memory_position: str = "system"
 
     def key(self) -> tuple:
         return (self.scenario, self.task_idx)
@@ -831,9 +835,15 @@ class RefineJob:
             task_id = getattr(reset_res.observation, "task_id", None)
             list_res = await env.step(ListToolsAction())
             tools_schema = tools_to_openai_schema(list_res.observation.tools)
+            system_prompt, user_prompt = self.student_system_prompt, task_description
+            if self.memory_text:
+                if self.memory_position == "user":
+                    user_prompt = f"{user_prompt}\n\n{self.memory_text}"
+                else:
+                    system_prompt = f"{system_prompt}\n\n{self.memory_text}"
             student_messages = [
-                {"role": "system", "content": self.student_system_prompt},
-                {"role": "user", "content": task_description},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ]
             if self.reconnect_before_verify:
                 await _close_quietly(env)
@@ -960,6 +970,8 @@ class RefineJob:
             "rounds_detail": rounds_detail,
             "elapsed_sec": elapsed,
             "error": error,
+            "memory_chars": len(self.memory_text or ""),
+            "memory_position": self.memory_position if self.memory_text else None,
         }
         record.update(_score_outcome(rounds_detail, success_at_round))
         return record
@@ -1094,7 +1106,29 @@ def _build_parser() -> argparse.ArgumentParser:
     add("--resume", action="store_true")
     add("--limit", type=int, default=None,
         help="Optional cap on total (scenario,task) pairs.")
+    add("--task-list", default=None,
+        help="JSONL of {scenario, task_idx} rows to run instead of scenario "
+             "ranges (e.g. a held-out evaluation split).")
+    add("--memory-jsonl", default=None,
+        help="JSONL of {scenario, task_idx?, text} memory rows. A row with "
+             "task_idx applies to that task only and takes precedence over a "
+             "scenario-wide row.")
+    add("--memory-position", choices=("system", "user"), default="system",
+        help="Append memory to the system prompt or after the user task.")
     return parser
+
+
+def _load_memory(path: str | None) -> dict[tuple, str]:
+    memory: dict[tuple, str] = {}
+    if not path:
+        return memory
+    with open(path, encoding="utf-8") as source:
+        for line in source:
+            if line.strip():
+                row = json.loads(line)
+                key = (row["scenario"], row.get("task_idx"))
+                memory[key] = row["text"]
+    return memory
 
 
 def _resolve_backend_args(args: argparse.Namespace) -> BackendProfile:
@@ -1196,6 +1230,12 @@ def _build_llm_clients(args: argparse.Namespace) -> tuple[RetryLLM, RetryLLM | N
 async def _select_work(args: argparse.Namespace,
                        profile: BackendProfile | None = None) -> list[tuple[str, int]]:
     profile = profile or _backend_profile(args.env_backend)
+    if getattr(args, "task_list", None):
+        with open(args.task_list, encoding="utf-8") as source:
+            todo = [(row["scenario"], int(row["task_idx"]))
+                    for row in map(json.loads, filter(str.strip, source))]
+        print(f"Selected {len(todo)} tasks from {args.task_list}")
+        return todo[:args.limit] if args.limit is not None else todo
     all_scenarios = await _discover_scenarios(profile, args.awm_base_url)
     print(f"Total scenarios on server: {len(all_scenarios)}")
     by_name = {item["name"]: item for item in all_scenarios}
@@ -1263,7 +1303,11 @@ def _build_jobs(args: argparse.Namespace, profile: BackendProfile,
         "judge_max_tokens": args.judge_max_tokens,
         "judge_timeout": judge_timeout,
     }
-    return [RefineJob(scenario=scenario, task_idx=task, **common)
+    memory = _load_memory(getattr(args, "memory_jsonl", None))
+    common["memory_position"] = getattr(args, "memory_position", "system")
+    return [RefineJob(scenario=scenario, task_idx=task,
+                      memory_text=memory.get((scenario, task), memory.get((scenario, None))),
+                      **common)
             for scenario, task in todo]
 
 

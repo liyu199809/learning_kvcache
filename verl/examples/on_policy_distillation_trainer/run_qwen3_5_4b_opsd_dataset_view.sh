@@ -118,7 +118,12 @@ else
     TEST_FREQ=${TEST_FREQ:-20}
     SAVE_FREQ=${SAVE_FREQ:-20}
     RESUME_MODE=${RESUME_MODE:-auto}
-    LOGGER_OVERRIDE='trainer.logger=["console","wandb"]'
+    # USE_WANDB=0 logs to the console only (no W&B account needed).
+    if [[ "${USE_WANDB:-1}" == 1 ]]; then
+        LOGGER_OVERRIDE='trainer.logger=["console","wandb"]'
+    else
+        LOGGER_OVERRIDE=trainer.logger=console
+    fi
 fi
 
 if [[ "$RUN_MODE" == smoke ]]; then
@@ -211,7 +216,7 @@ for url in "${ENV_URLS[@]}"; do
     fi
 done
 
-if [[ "$RUN_MODE" == full ]]; then
+if [[ "$RUN_MODE" == full && "${USE_WANDB:-1}" == 1 ]]; then
     if ! "$PYTHON_BIN" -c 'import wandb' >/dev/null 2>&1; then
         echo "wandb is not installed in the selected base runtime: $PYTHON_BIN" >&2
         exit 1
@@ -330,7 +335,8 @@ fi
     trainer.max_critic_ckpt_to_keep=3 \
     trainer.total_epochs="$TOTAL_EPOCHS" \
     trainer.resume_mode="$RESUME_MODE" \
-    trainer.use_v1=False \
+    trainer.use_v1="${USE_V1:-False}" \
+    trainer.v1.trainer_mode="${TRAINER_MODE:-sync}" \
     distillation.enabled=True \
     distillation.self_distillation=True \
     distillation.n_gpus_per_node="$TEACHER_GPUS" \

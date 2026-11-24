@@ -37,6 +37,8 @@ def add_coding_args(parser):
                        default=os.environ.get("CODE_EXECUTION_BACKEND", "docker"),
                        help="Official scorer execution sandbox; nsjail needs no Docker/cgroup writes.")
     group.add_argument("--code-docker-image", default="ubuntu:latest")
+    group.add_argument("--code-sandbox", choices=("docker", "local"), default="docker",
+                       help="local: score without Docker as uid 65534 in a network-less namespace.")
     group.add_argument("--code-memory", default="8g")
     group.add_argument("--lcb-release", choices=("v5", "v6"), default="v6",
                        help="Official cumulative release: v5 (880 tasks) or v6 (1055 tasks).")
